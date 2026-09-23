@@ -1,0 +1,22 @@
+# Core deps for Hub-and-Spoke evaluation.
+#
+# 1. conda create -n vlm python=3.10.20
+#    Install torch separately matching your CUDA *before* this file, e.g.:
+#    pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+
+accelerate==1.13.0
+# sentence-transformers>=3.0.0  # optional: used if available, else falls back
+#   to AutoModel mean-pooling via transformers (already required above)
+av==17.0.0
+numpy==2.2.6
+pillow==12.2.0
+qwen-vl-utils==0.0.11
+tqdm==4.67.3
+transformers==5.5.0
+decord==0.6.0
+
+# 2. pip install -r requirements.txt
+# 
+# 3. flash-attn needs torch installed first and must build against your CUDA:
+#    pip install flash-attn==2.8.3 --no-build-isolation
+#    (or pass --attn-implementation sdpa to skip flash-attn entirely)
