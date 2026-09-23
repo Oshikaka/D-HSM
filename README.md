@@ -195,11 +195,8 @@ scripts/
   download_ovo.sh                fetch OVO-Bench annotations + chunked videos
   download_streamingbench.sh     fetch StreamingBench questions + videos
   download_models.sh             fetch the VLM backbone + embedder weights
-tests/
-  smoke_gate_incremental.py      CPU smoke test (gate + Algorithm 2 memory)
 ```
 
-Datasets, model weights, logs, and generated results are not included.
 
 ## 🙏 Acknowledgements
 
