@@ -142,26 +142,17 @@ accelerate launch --num_processes 2 experiments/evaluate_ovo.py \
 
 ## ⚙️ Defaults
 
-The code ships with the paper's configuration, so you should not need any of
-these flags to reproduce the numbers — they are here for when you want to
-poke at the method.
 
 | | default | flag |
 | --- | --- | --- |
-| retrieval gate | `keyword` — question/option text only, never task labels or answers | `--routing` |
+| retrieval gate | `keyword` — question/option text only | `--routing` |
 | memory | `entity_resolved` — chunk-local entity IDs linked across chunks by similarity | `--memory_mode` |
-| retrieval budget | `dynamic` — salient-gap cutoff, capped per backbone on OVO (8 for Qwen2.5-VL, 12 otherwise) and at 12 on StreamingBench | `--top_k`, `--dynamic_top_k_max` |
+| retrieval budget | `dynamic` — salient-gap cutoff | `--top_k`, `--dynamic_top_k_max` |
 | history budget | 20 chunks | `--max_extraction_chunks` |
 | recent window | 4 frames | `--recent_frames_only` |
 | embeddings | bge-small-en-v1.5 | `--embed_model` |
 | attention | `flash_attention_2` (`sdpa` to skip flash-attn) | `--attn_implementation` |
-| OVO MCQ prompt | `uniform_abstention` — one instruction for every MCQ task | `--mcq_prompt_policy` |
 
-Passing an integer to `--top_k` gives the *static* top-K baseline (Table 6
-"Fixed Top-k", Fig. 1 point D), not D-HSM. `--memory_mode` also accepts
-`hub_spoke`, `flat_caption` and `incremental` (Algorithm 2 with per-chunk
-provenance) for ablations, and `--history_mode recent_only` on OVO drops memory
-entirely for the recent-frames-only baseline.
 
 Results are checkpointed per rank and resumed on restart; a run directory
 refuses to resume under a different protocol, so point `OUT` / `--result_dir`
