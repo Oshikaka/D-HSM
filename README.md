@@ -36,45 +36,22 @@ slice of that memory it actually needs. No training, no extra parameters.
 - **State of the art on both streaming benchmarks**, at 20+4 frames rather than
   the 1 fps most online baselines consume.
 
-| | OVO-Bench | StreamingBench |
-| --- | --- | --- |
-| **D-HSM (ours)** | **66.8** | **85.4** |
-| best open-source online baseline | 57.9 (Streamo) | 77.3 (Streamforest) |
-| Gemini 1.5 Pro | 63.0 | 75.7 |
-| GPT-4o | 59.5 | 73.3 |
-| Human | 92.8 | 91.5 |
-
-On StreamingBench the same frozen Qwen2.5-VL backbone goes from 73.7 to 84.7
-once D-HSM is wrapped around it — the gain is the memory, not the model.
-
-## 📊 Results
-
-Full per-task numbers. D-HSM rows are shaded; **bold** is best, underlined is
-second best.
-
-**OVO-Bench**
-
-<p align="center"><img src="assets/OVOBench.png" alt="OVO-Bench results" width="100%"></p>
-
-**StreamingBench**
-
-<p align="center"><img src="assets/StreamingBench.png" alt="StreamingBench results" width="100%"></p>
 
 ## ⚙️ Quick Start
 
 ### 1. Environment
 You can also follow the detailed steps in `requirements.txt`.
 ```bash
-# 1. Create vlm conda environment. Install torch separately matching your CUDA *before* run requirements.txt, e.g.:
+# 1. Create the vlm conda env. Install torch matching your CUDA *before* requirements.txt, e.g.:
 conda create -n vlm python=3.10.20 && conda activate vlm
-pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.9.1 torchvision==0.24.1 torchcodec==0.9.0 --index-url https://download.pytorch.org/whl/cu128
 
 # 2. Install the rest of the deps
 pip install -r requirements.txt
 
-# 3. flash-attn builds against the torch/CUDA installed in step 1
+# 3. flash-attn (the default attention backend), built against the torch/CUDA installed in step 1.
+#    Or skip it and pass --attn_implementation sdpa (ATTN_IMPLEMENTATION=sdpa for run_eval.sh).
 pip install flash-attn==2.8.3 --no-build-isolation
-# or pass --attn-implementation sdpa to skip flash-attn entirely
 ```
 
 ### 2. Benchmarks
@@ -82,21 +59,22 @@ pip install flash-attn==2.8.3 --no-build-isolation
 The two download scripts fetch annotations and videos. They are large
 (OVO-Bench alone is ~144 GB), so give them a disk with room to spare.
 
-Both scripts need `ROOT` — the directory that `data/` will be created under.
-Set it on the command line, or edit the `ROOT=` line at the top of each script.
-They refuse to run until it is filled in.
+Every command below runs from the repo root and uses `ROOT` — the directory
+that `data/` and `models/` will be created under. Export it once in your shell
+so the download, model and run steps all see the same value (the download
+scripts refuse to run until it is set):
 
 ```bash
-ROOT=/path/to/your/workspace bash scripts/download_ovo.sh            # OVO-Bench
-ROOT=/path/to/your/workspace bash scripts/download_streamingbench.sh # StreamingBench
+export ROOT=/path/to/your/workspace
+bash scripts/download_ovo.sh            # OVO-Bench
+bash scripts/download_streamingbench.sh # StreamingBench
 ```
 
 Run them with the `vlm` env active so `pip` and `hf` resolve to it. If you would
 rather not activate it, point `PY_BIN` at the env instead:
 
 ```bash
-ROOT=/path/to/your/workspace PY_BIN=~/miniconda3/envs/vlm/bin \
-  bash scripts/download_ovo.sh
+PY_BIN=~/miniconda3/envs/vlm/bin bash scripts/download_ovo.sh
 ```
 
 You end up with:
@@ -104,8 +82,8 @@ You end up with:
 ```
 $ROOT/data/ovo_bench/ovo_bench_new.json        # --anno_path
 $ROOT/data/ovo_bench/chunked_videos/           # --chunked_dir
-$ROOT/data/streamingbench/questions_real.json
-$ROOT/data/streamingbench/videos/
+$ROOT/data/streamingbench/questions_real.json  # --anno_path
+$ROOT/data/streamingbench/videos/              # --video_dir
 ```
 
 ### 3. Models
@@ -115,7 +93,7 @@ also accept plain HF repo ids and will pull them on first use. This script just
 puts them somewhere you control.
 
 ```bash
-ROOT=/path/to/your/workspace bash scripts/download_models.sh
+bash scripts/download_models.sh   # uses the exported ROOT
 ```
 
 ```
@@ -128,14 +106,18 @@ Reproducing a different backbone row? Override the repo:
 
 ## 🚀 Run
 
-With the `vlm` env active, the driver script covers the common cases:
+With the `vlm` env active and from the repo root (the script calls
+`experiments/*.py` by relative path), the driver script covers the common cases.
+`$ROOT` is the one you exported above; if this is a new shell, export it again first.
 
 ```bash
-DATA_ROOT=$ROOT/data scripts/run_eval.sh              # both benchmarks
-BENCH=ovo DATA_ROOT=$ROOT/data scripts/run_eval.sh    # ovo | sb | both
+DATA_ROOT=$ROOT/data scripts/run_eval.sh                                # both benchmarks
+BENCH=ovo DATA_ROOT=$ROOT/data scripts/run_eval.sh                      # ovo | sb | both
+BENCH=sb RECENT_FRAMES=8 DATA_ROOT=$ROOT/data scripts/run_eval.sh       # change the recent window
 ```
 
-It defaults to the HF repo ids. To use the weights you just downloaded:
+It defaults to the HF repo ids `Qwen/Qwen2.5-VL-7B-Instruct` and
+`BAAI/bge-small-en-v1.5`. To use the weights you just downloaded:
 
 ```bash
 MODEL_PATH=$ROOT/models/Qwen2.5-VL-7B-Instruct \
@@ -143,7 +125,11 @@ EMBED_MODEL=$ROOT/models/bge-small-en-v1.5 \
 DATA_ROOT=$ROOT/data scripts/run_eval.sh
 ```
 
-Or call an evaluator directly, you can see more examples at the bottom of `experiments/evaluate_ovo.py` and `experiments/evaluate_streamingbench.py`:
+Other knobs: `NPROC` sets the GPU count (default 2), `OUT` the result directory,
+and `ATTN_IMPLEMENTATION` the attention backend (default `flash_attention_2`).
+
+Or call an evaluator directly; more examples sit at the bottom of
+`experiments/evaluate_ovo.py` and `experiments/evaluate_streamingbench.py`:
 
 ```bash
 accelerate launch --num_processes 2 experiments/evaluate_ovo.py \
@@ -162,40 +148,25 @@ poke at the method.
 
 | | default | flag |
 | --- | --- | --- |
-| retrieval gate | `keyword` — question text only | `--routing` |
-| memory | `incremental` — Algorithm 2, per-chunk provenance | `--memory_mode` |
-| retrieval budget | `dynamic` — salient-gap cutoff capped at K=12 | `--top_k` |
+| retrieval gate | `keyword` — question/option text only, never task labels or answers | `--routing` |
+| memory | `entity_resolved` — chunk-local entity IDs linked across chunks by similarity | `--memory_mode` |
+| retrieval budget | `dynamic` — salient-gap cutoff, capped per backbone on OVO (8 for Qwen2.5-VL, 12 otherwise) and at 12 on StreamingBench | `--top_k`, `--dynamic_top_k_max` |
 | history budget | 20 chunks | `--max_extraction_chunks` |
 | recent window | 4 frames | `--recent_frames_only` |
 | embeddings | bge-small-en-v1.5 | `--embed_model` |
+| attention | `flash_attention_2` (`sdpa` to skip flash-attn) | `--attn_implementation` |
+| OVO MCQ prompt | `uniform_abstention` — one instruction for every MCQ task | `--mcq_prompt_policy` |
 
 Passing an integer to `--top_k` gives the *static* top-K baseline (Table 6
-"Fixed Top-k", Fig. 1 point D), not D-HSM.
+"Fixed Top-k", Fig. 1 point D), not D-HSM. `--memory_mode` also accepts
+`hub_spoke`, `flat_caption` and `incremental` (Algorithm 2 with per-chunk
+provenance) for ablations, and `--history_mode recent_only` on OVO drops memory
+entirely for the recent-frames-only baseline.
 
+Results are checkpointed per rank and resumed on restart; a run directory
+refuses to resume under a different protocol, so point `OUT` / `--result_dir`
+somewhere new when you change flags.
 
-## 📁 Files
-
-```
-dhsm/                            the method; benchmark-agnostic
-  retrieval_gate.py              keyword gate (§3.3); question text only, no GPU deps
-  hub_and_spoke_incremental.py   Algorithm 2 memory with per-chunk provenance (default)
-  hub_and_spoke.py               base memory: scoring, dynamic cutoff, expansion, rendering
-  video_qa.py                    Qwen2.5-VL decoding, prompting, logit scoring
-  video_qa_qwen3.py              Qwen3-VL cached-vision wrapper
-  shard_io.py                    resumable per-rank JSONL checkpointing
-experiments/
-  ovo_bench.py                   OVO task spec: prompts, answer parsing, scoring
-  evaluate_ovo.py                OVO-Bench: backward, real-time, forward (REC/SSR/CRR)
-  evaluate_ovo_ablations.py      alternative REC counting / CRR readouts
-  evaluate_streamingbench.py     StreamingBench
-  verify_retrieval_gate.py       offline routing audit
-  compare_gate_ab.py             per-task delta between two routing modes
-scripts/
-  run_eval.sh                    OVO / StreamingBench driver
-  download_ovo.sh                fetch OVO-Bench annotations + chunked videos
-  download_streamingbench.sh     fetch StreamingBench questions + videos
-  download_models.sh             fetch the VLM backbone + embedder weights
-```
 
 
 ## 🙏 Acknowledgements

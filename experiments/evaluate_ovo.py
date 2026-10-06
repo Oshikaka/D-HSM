@@ -1,28 +1,22 @@
 """Hub-and-Spoke OVO-Bench evaluation: the full backward/real-time/forward pipeline.
 
-Backward and real-time tasks are answered by retrieving from hub-and-spoke
-memory (or a recent-window fallback) via ``dhsm.hub_and_spoke``. The forward
-tasks use dedicated causal readouts: REC counts via interval-delta counting
-(``RecIntervalCounter``), SSR via recent-window A/B logits, and CRR via
-interval-evidence tracking (``CrrIntervalTracker``). Ships one CLI (``main``).
-
-The other REC/CRR counting methods explored during development (storyboard,
-segmented, contact_sheet, delta, event, hybrid for REC; tail, tail_mono for
-CRR) live in ``evaluate_ovo_ablations.py``, which imports the frame-sampling
-helpers defined here.
+MCQ retrieval uses only question/option text. Task annotations select benchmark
+formats and reporting groups; correct answers are used only for scoring.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import importlib.metadata
 import json
 import logging
+import math
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -39,6 +33,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dhsm import shard_io
+from dhsm.evaluation_protocol import ensure_result_protocol
+from dhsm.benchmark_defaults import ovo_defaults
 from dhsm.hub_and_spoke import (
     DEFAULT_EMBED_MODEL,
     DYNAMIC_TOP_K_MAX,
@@ -46,16 +42,9 @@ from dhsm.hub_and_spoke import (
     HubAndSpokeMemory,
     round_sims,
 )
-from dhsm.retrieval_gate import (
-    DEFAULT_GATE_STRICT_SIM,
-    MEMORY_MODE_CHOICES,
-    ROUTING_CHOICES,
-    ROUTING_KEYWORD,
-    ROUTING_TASK_LABEL,
-    GateDecision,
-    evaluator_class_for,
-    gate_question,
-    resolve_memory_mode,
+from dhsm.retrieval_gate import ROUTING_CHOICES, ROUTING_KEYWORD
+from dhsm.memory_selection import (
+    MEMORY_MODE_CHOICES, evaluator_class_for, resolve_memory_mode,
 )
 from dhsm.video_qa import decode_video_to_chunks_qwen
 from dhsm.video_qa_qwen3 import RecentWindowQAModel
@@ -63,9 +52,21 @@ from dhsm.video_qa_qwen3 import RecentWindowQAModel
 from experiments.ovo_bench import (
     BACKWARD_TASKS,
     FORWARD_TASKS,
+    MCQ_PROMPT_UNIFORM,
+    MCQ_PROMPT_POLICIES,
     REAL_TIME_TASKS,
     build_prompt,
+    build_mcq_prompt,
     print_report,
+)
+from experiments.ovo_protocol import (
+    HISTORY_DHSM,
+    HISTORY_MODES,
+    HISTORY_RECENT_ONLY,
+    DEFAULT_MEMORY_FLOOR,
+    DEFAULT_OVO_GATE_STRICT_SIM,
+    UNIFORM_ABSTENTION_INSTRUCTION,
+    answer_route_for as _answer_route_for,
 )
 
 logging.basicConfig(
@@ -100,109 +101,83 @@ def parse_top_k_arg(raw: str) -> int | str:
     return top_k
 
 
-def format_top_k(top_k: int | str) -> str:
+def format_top_k(top_k: int | str, dynamic_top_k_max: int = DYNAMIC_TOP_K_MAX) -> str:
     if isinstance(top_k, str):
-        return f"{top_k}(max={DYNAMIC_TOP_K_MAX})"
+        return f"{top_k}(max={dynamic_top_k_max})"
     return str(top_k)
 
 
-@dataclass(frozen=True)
-class AnswerRoute:
-    method_family: str
-    policy: str
-    use_memory: bool
-    include_no_match_signal: bool
-    num_options: int
-    min_evidence_sim: float | None = None
-    gate: GateDecision | None = None
-
-
-def _answer_route_for(
-    anno: dict[str, Any],
-    routing: str = ROUTING_KEYWORD,
-    gate_strict_sim: float = DEFAULT_GATE_STRICT_SIM,
-) -> AnswerRoute:
-    """Decide how one annotation is answered.
-
-    With ``routing="keyword"`` (default) the memory/recent-window decision
-    comes from ``dhsm.retrieval_gate`` reading the question text only, which
-    is the mechanism the paper describes.  ``routing="task_label"`` restores
-    the previous behaviour, which read the OVO task label (EPM/ASI/HLD vs the
-    six Real-Time tasks) — i.e. ground-truth benchmark metadata — and is kept
-    only so the earlier numbers can be reproduced.
-
-    NOTE: the HLD abstain policy still keys off the task label.  Deriving it
-    from text is not possible: HLD questions are lexically identical to EPM
-    ones ("Where is the rice cooker?"), so it is a separate discrepancy from
-    the retrieval gate and is deliberately left untouched here.
-    """
-    task = anno.get("task")
-    options = anno.get("options") or []
-    num_options = len(options) if options else 4
-
-    is_hld = task == "HLD"
-    policy = "hld_abstain_on_insufficient_evidence" if is_hld else "standard_mcq"
-
-    if routing == ROUTING_TASK_LABEL:
-        decision = None
-        use_memory = task in BACKWARD_TASKS
-        min_evidence_sim = None
-    else:
-        decision = gate_question(str(anno.get("question", "")), options)
-        use_memory = decision.needs_memory
-        min_evidence_sim = gate_strict_sim if decision.strict_evidence else None
-
-    return AnswerRoute(
-        method_family="hub_and_spoke_memory" if use_memory else "recent_window",
-        policy=policy,
-        use_memory=use_memory,
-        include_no_match_signal=is_hld,
-        num_options=num_options,
-        min_evidence_sim=min_evidence_sim,
-        gate=decision,
-    )
+def mcq_query_cutoff(anno: dict[str, Any]) -> float:
+    cutoff = anno.get("realtime")
+    if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff) or cutoff < 0:
+        raise ValueError("MCQ annotations require a finite nonnegative realtime query cutoff.")
+    return float(cutoff)
 
 
 def _build_and_answer(
-    anno: dict[str, Any],
+    question: str,
+    options: list[str],
+    query_cutoff: float,
     video_path: str,
     evaluator: HubAndSpokeEvaluator,
     chunk_duration: float,
     fps: float,
     recent_frames_only: int,
-    prompt: str,
-    use_logits: bool = False,
+    use_logits: bool = True,
     routing: str = ROUTING_KEYWORD,
-    gate_strict_sim: float = DEFAULT_GATE_STRICT_SIM,
+    memory_floor: float = DEFAULT_MEMORY_FLOOR,
+    gate_strict_sim: float = DEFAULT_OVO_GATE_STRICT_SIM,
+    mcq_prompt_policy: str = MCQ_PROMPT_UNIFORM,
+    history_mode: str = HISTORY_DHSM,
 ) -> tuple[str | None, dict[str, Any]]:
+    """Infer from observable inputs only; annotations stay in the caller."""
     if not os.path.exists(video_path):
-        return None, {}
+        return None, {"error": "missing_video", "video_path": video_path}
     try:
-        route = _answer_route_for(anno, routing=routing, gate_strict_sim=gate_strict_sim)
+        query_cutoff = mcq_query_cutoff({"realtime": query_cutoff})
+        prompt = build_mcq_prompt(question, options)
+        route = _answer_route_for(
+            question, options, routing=routing, memory_floor=memory_floor,
+            gate_strict_sim=gate_strict_sim,
+            mcq_prompt_policy=mcq_prompt_policy,
+            history_mode=history_mode,
+        )
         chunks, decode_backend = decode_video_to_chunks_qwen(
             video_path=video_path,
             chunk_duration=chunk_duration,
             fps=fps,
+            video_end=query_cutoff,
         )
         if not chunks:
-            return None, {}
+            return None, {"error": "empty_video", "video_path": video_path}
+        decoded_timestamps = [timestamp for chunk in chunks
+                              for timestamp, _ in chunk_frames_with_timestamps(chunk)]
+        if (not decoded_timestamps or decoded_timestamps != sorted(decoded_timestamps)
+                or any(timestamp < 0 or timestamp > query_cutoff for timestamp in decoded_timestamps)):
+            raise ValueError("Decoded MCQ frame PTS exceed the query cutoff or are unavailable.")
+        max_decoded_timestamp = max(decoded_timestamps)
 
         window = max(1, recent_frames_only)
         hist_chunks = chunks[:-window] if len(chunks) > window else []
         recent_chunks = chunks[-window:]
-        recent_frames = [f for c in recent_chunks for f in c.frames]
+        # At the default 1 fps / 1 s chunks this is the same selected 4-frame
+        # window. Higher sampling rates still respect the actual frame budget.
+        recent_items = [item for chunk in recent_chunks
+                        for item in chunk_frames_with_timestamps(chunk)][-window:]
+        recent_timestamps = [timestamp for timestamp, _ in recent_items]
+        recent_frames = [frame for _, frame in recent_items]
 
         t0 = time.perf_counter()
         memory = (
             evaluator.build_memory_from_chunks(hist_chunks, question=prompt)
             if route.use_memory
-            else HubAndSpokeMemory(
-                embed_model=evaluator.embed_model,
-                embed_device=evaluator.embed_device,
-                sim_threshold=evaluator.sim_threshold,
-            )
+            else evaluator._make_memory()
         )
         evaluator.last_retrieval = None
+        answer_kwargs = (
+            {"answer_instruction": route.answer_instruction}
+            if route.answer_instruction else {}
+        )
         if use_logits:
             response = evaluator.answer_with_memory_mcq(
                 memory,
@@ -211,6 +186,7 @@ def _build_and_answer(
                 num_options=route.num_options,
                 include_no_match_signal=route.include_no_match_signal,
                 min_evidence_sim=route.min_evidence_sim,
+                **answer_kwargs,
             )
         else:
             response = evaluator.answer_with_memory(
@@ -219,6 +195,7 @@ def _build_and_answer(
                 prompt,
                 include_no_match_signal=route.include_no_match_signal,
                 min_evidence_sim=route.min_evidence_sim,
+                **answer_kwargs,
             )
         elapsed = time.perf_counter() - t0
         retrieval = evaluator.last_retrieval
@@ -228,32 +205,37 @@ def _build_and_answer(
             "answer_policy": route.policy,
             "answer_num_options": route.num_options,
             "routing_mode": routing,
+            "mcq_prompt_policy": mcq_prompt_policy,
+            "history_mode": history_mode,
             "route_use_memory": route.use_memory,
             "route_min_evidence_sim": route.min_evidence_sim,
-            # Agreement audit: what the old task-label rule would have decided.
-            "route_use_memory_task_label": anno.get("task") in BACKWARD_TASKS,
+            "memory_floor": memory_floor,
+            "gate_strict_sim": gate_strict_sim,
+            "answer_instruction": route.answer_instruction,
+            "include_no_match_signal": route.include_no_match_signal,
+            "retrieval_query": prompt,
+            "retrieval_context": retrieval.context if retrieval is not None else "",
+            "retrieval_dynamic_top_k_max": memory.dynamic_top_k_max,
             **(route.gate.as_metadata() if route.gate is not None else {}),
             "decode_backend": decode_backend,
+            "query_cutoff": query_cutoff,
+            "max_decoded_timestamp": max_decoded_timestamp,
             "generate_time": elapsed,
             "num_hist_chunks": len(hist_chunks),
             "num_recent_frames": len(recent_frames),
+            "recent_frame_timestamps": recent_timestamps,
             "retrieval_matched_nodes": (
                 retrieval.matched_nodes if retrieval is not None else None
             ),
             "retrieval_signal": retrieval.signal if retrieval is not None else None,
             "retrieval_hit_count": retrieval.hit_count if retrieval is not None else None,
-            # Raw cosine scores, so the gate's evidence floor can be re-swept
-            # offline from this run instead of one evaluation run per threshold.
             "retrieval_hit_sims": round_sims(retrieval, "hit_sims"),
             "retrieval_candidate_sims": round_sims(retrieval, "candidate_sims"),
             **{f"hub_spoke_{k}": v for k, v in memory.stats().items()},
         }
         return response, metadata
     except Exception:
-        logger.exception(
-            "Sample failed: id=%s task=%s video=%s",
-            anno.get("id"), anno.get("task"), video_path,
-        )
+        logger.exception("MCQ sample failed: video=%s", video_path)
         return None, {"error": "exception", "video_path": video_path}
 
 
@@ -266,37 +248,43 @@ def evaluate_backward_realtime(
     recent_frames_only: int,
     use_logits: bool = True,
     routing: str = ROUTING_KEYWORD,
-    gate_strict_sim: float = DEFAULT_GATE_STRICT_SIM,
+    memory_floor: float = DEFAULT_MEMORY_FLOOR,
+    gate_strict_sim: float = DEFAULT_OVO_GATE_STRICT_SIM,
+    mcq_prompt_policy: str = MCQ_PROMPT_UNIFORM,
+    history_mode: str = HISTORY_DHSM,
 ) -> dict[str, Any]:
     video_path = os.path.join(chunked_dir, f"{anno['id']}.mp4")
-    prompt = build_prompt(anno["task"], anno)
     response, metadata = _build_and_answer(
-        anno,
+        anno["question"], list(anno["options"]), mcq_query_cutoff(anno),
         video_path,
         evaluator,
         chunk_duration,
         fps,
         recent_frames_only,
-        prompt,
         use_logits=use_logits,
         routing=routing,
+        memory_floor=memory_floor,
         gate_strict_sim=gate_strict_sim,
+        mcq_prompt_policy=mcq_prompt_policy,
+        history_mode=history_mode,
     )
     return {
         "id": anno["id"],
         "video": anno["video"],
         "task": anno["task"],
         "question": anno["question"],
+        "options": list(anno["options"]),
         "response": response,
         "ground_truth": chr(65 + anno["gt"]),
+        "routing_mode": routing,
+        "mcq_prompt_policy": mcq_prompt_policy,
+        "history_mode": history_mode,
         **metadata,
     }
 
 
 # ---------------------------------------------------------------------------
 # Forward readouts: shared frame-sampling helpers.
-#
-# Also imported by evaluate_ovo_ablations.py for its own REC methods.
 # ---------------------------------------------------------------------------
 
 def fmt_time(seconds: float) -> str:
@@ -310,14 +298,12 @@ def chunk_frames_with_timestamps(chunk) -> list[tuple[float, Any]]:
     if not frames:
         return []
     timestamps = getattr(chunk, "frame_timestamps", None)
-    if timestamps and len(timestamps) == len(frames):
-        return [(float(ts), frame) for ts, frame in zip(timestamps, frames)]
-    span = max(float(chunk.end_time) - float(chunk.start_time), 1e-6)
-    count = len(frames)
-    return [
-        (float(chunk.start_time) + span * (idx + 0.5) / count, frame)
-        for idx, frame in enumerate(frames)
-    ]
+    if timestamps is None or len(timestamps) != len(frames):
+        raise ValueError("Nonempty video chunks require one actual frame PTS per frame.")
+    if any(isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts)
+           for ts in timestamps):
+        raise ValueError("Video frame PTS must be finite numeric timestamps.")
+    return [(float(ts), frame) for ts, frame in zip(timestamps, frames)]
 
 
 def uniform_indices(total: int, k: int) -> list[int]:
@@ -504,6 +490,7 @@ class RecIntervalCounter:
                     "interval_delta_new_count": 0,
                     "interval_delta_label": "A",
                     "interval_delta_num_frames": 0,
+                    "interval_delta_frame_timestamps": [],
                     "interval_delta_prev_cutoff": previous_cutoff,
                     "interval_delta_cutoff": cutoff,
                     "interval_delta_label_counts": dict(label_counts),
@@ -551,6 +538,7 @@ class RecIntervalCounter:
                 "interval_delta_new_count": delta,
                 "interval_delta_label": label,
                 "interval_delta_num_frames": len(frames),
+                "interval_delta_frame_timestamps": timestamps,
                 "interval_delta_first_ts": timestamps[0] if timestamps else None,
                 "interval_delta_last_ts": timestamps[-1] if timestamps else None,
                 "interval_delta_prev_cutoff": previous_cutoff,
@@ -609,7 +597,7 @@ class CrrIntervalTracker:
         qa_model: RecentWindowQAModel,
         interval_frames: int = 16,
         interval_context_seconds: float = 1.0,
-        force_first_no: bool = True,
+        force_first_no: bool = False,
     ) -> None:
         self.qa = qa_model
         self.interval_frames = max(1, int(interval_frames))
@@ -683,6 +671,7 @@ class CrrIntervalTracker:
                 "interval_evidence_prev_cutoff": previous_cutoff,
                 "interval_evidence_cutoff": cutoff,
                 "interval_evidence_num_frames": len(frames),
+                "interval_evidence_frame_timestamps": timestamps,
                 "interval_evidence_first_ts": timestamps[0] if timestamps else None,
                 "interval_evidence_last_ts": timestamps[-1] if timestamps else None,
                 "interval_evidence_has_context": has_context,
@@ -724,7 +713,7 @@ class ForwardEvaluator:
         rec_interval_max_delta: int = 2,
         crr_interval_frames: int = 16,
         crr_interval_context_seconds: float = 1.0,
-        crr_force_first_no: bool = True,
+        crr_force_first_no: bool = False,
     ) -> None:
         self.qa = qa_model
         self.recent_frames = max(1, int(recent_frames))
@@ -769,7 +758,16 @@ class ForwardEvaluator:
                     old.frames = []
                 pending = next(chunk_iter, None)
 
-            recent_frames = [f for c in recent_buffer for f in c.frames]
+            # The decoder provides actual PTS. Filter the frame timestamps as
+            # well as chunk boundaries, then log exactly what the model saw.
+            recent_items = [
+                (timestamp, frame)
+                for chunk in recent_buffer
+                for timestamp, frame in chunk_frames_with_timestamps(chunk)
+                if timestamp <= cutoff
+            ]
+            recent_frames = [frame for _, frame in recent_items]
+            recent_timestamps = [timestamp for timestamp, _ in recent_items]
             prompt = _ssr_prompt(ti["step"])
             response = self._score_yes_no(recent_frames, prompt)
             elapsed = time.perf_counter() - t0
@@ -781,6 +779,9 @@ class ForwardEvaluator:
                     "generate_time": elapsed,
                     "num_recent_chunks": len(recent_buffer),
                     "num_recent_frames": len(recent_frames),
+                    "recent_frame_timestamps": recent_timestamps,
+                    "recent_first_ts": recent_timestamps[0] if recent_timestamps else None,
+                    "recent_last_ts": recent_timestamps[-1] if recent_timestamps else None,
                     "realtime_cutoff": cutoff,
                     "readout": "recent_window_ab_logits",
                     "readout_task": "SSR",
@@ -958,6 +959,20 @@ def merge_shard_results(result_dir: str, n_procs: int):
     return _bucket_rows(shard_io.merge_shards(result_dir, n_procs, key_fn=row_key))
 
 
+def add_crr_first_response_arguments(parser: argparse.ArgumentParser) -> None:
+    """Observe first-cutoff evidence by default; retain an explicit legacy flag."""
+    first_response = parser.add_mutually_exclusive_group()
+    first_response.add_argument(
+        "--crr_force_first_no", dest="crr_no_force_first_no", action="store_false",
+        help="Legacy CRR diagnostic: force No at the first cutoff without observing frames.",
+    )
+    first_response.add_argument(
+        "--crr_no_force_first_no", dest="crr_no_force_first_no", action="store_true",
+        help="Use observed evidence at the first CRR cutoff (default; retained compatibility flag).",
+    )
+    parser.set_defaults(crr_no_force_first_no=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Hub-and-Spoke full OVO-Bench evaluation"
@@ -965,11 +980,11 @@ def main() -> None:
     parser.add_argument("--model_path", required=True)
     parser.add_argument(
         "--anno_path",
-        default="/data/linzhao/vlm/data/ovo_bench/ovo_bench_new.json",
+        default="data/ovo_bench/ovo_bench_new.json",
     )
     parser.add_argument(
         "--chunked_dir",
-        default="/data/linzhao/vlm/data/ovo_bench/chunked_videos",
+        default="data/ovo_bench/chunked_videos",
     )
     parser.add_argument("--result_dir", default="results/hub_and_spoke_ovo")
     parser.add_argument("--recent_frames_only", type=int, default=4)
@@ -979,7 +994,7 @@ def main() -> None:
     parser.add_argument(
         "--attn_implementation",
         default="flash_attention_2",
-        help="Attention backend for the VLM (e.g. flash_attention_2, sdpa).",
+        help="Attention backend for the VLM (default: flash_attention_2; pass sdpa to skip flash-attn).",
     )
     parser.add_argument("--extract_every_n_chunks", type=int, default=1)
     parser.add_argument("--max_extraction_chunks", type=int, default=20)
@@ -989,21 +1004,38 @@ def main() -> None:
         choices=ROUTING_CHOICES,
         default=ROUTING_KEYWORD,
         help=(
-            "How the memory/recent-window decision is made. 'keyword' (default) "
-            "gates on question text only, as described in the paper. 'task_label' "
-            "reads the OVO task annotation (EPM/ASI/HLD vs Real-Time tasks) and is "
-            "kept only to reproduce the pre-gate numbers."
+            "Gate on question/option text, without MCQ task annotations or GT."
         ),
     )
     parser.add_argument(
-        "--gate_strict_sim",
-        type=float,
-        default=DEFAULT_GATE_STRICT_SIM,
+        "--history_mode",
+        choices=HISTORY_MODES,
+        default=HISTORY_DHSM,
         help=(
-            "Similarity floor applied when the keyword gate cannot tell whether "
-            "history is needed (the 'ambiguous' bucket). History is injected only "
-            "if some memory entry clears it. Ignored when --routing task_label."
+            "MCQ history ablation: 'dhsm' (default) follows the retrieval gate; "
+            "'recent_only' skips all history construction while using the same "
+            "recent visual window, MCQ prompt policy and QA method. "
+            "recent_only requires --splits backward,realtime (or a subset)."
         ),
+    )
+    parser.add_argument(
+        "--mcq_prompt_policy",
+        choices=MCQ_PROMPT_POLICIES,
+        default=MCQ_PROMPT_UNIFORM,
+        help=(
+            "'uniform_abstention' (default) adds one fixed evidence instruction "
+            "to every MCQ after retrieval; 'official' uses the original benchmark "
+            "QA prompt. Both use the same original caption/retrieval query."
+        ),
+    )
+    parser.add_argument(
+        "--memory_floor", type=float, default=None,
+        help="Post-filter floor for strong-memory retrieval seeds; default follows the backbone profile.",
+    )
+    parser.add_argument(
+        "--gate_strict_sim", type=float, default=None,
+        help="Post-filter floor for ambiguous retrieval seeds; default follows the backbone profile. "
+             "Neither floor changes the dynamic cutoff or graph/timeline expansion.",
     )
     parser.add_argument(
         "--top_k",
@@ -1011,26 +1043,25 @@ def main() -> None:
         default="dynamic",
         help=(
             "Fixed retrieval budget (int), or dynamic/auto/adaptive for "
-            f"elbow-cutoff mode capped at {DYNAMIC_TOP_K_MAX}. Defaults to "
+            "elbow-cutoff mode capped by --dynamic_top_k_max. Defaults to "
             "dynamic: a fixed budget is the Table 6 / Fig. 1 'static HSM "
             "retrieval' baseline, not D-HSM."
         ),
+    )
+    parser.add_argument(
+        "--dynamic_top_k_max", type=int, default=None,
+        help="Maximum candidate pool for dynamic retrieval; default follows the backbone profile. "
+             "The original elbow rule can select fewer seeds; integer --top_k is unchanged.",
     )
     parser.add_argument(
         "--embed_model",
         default=DEFAULT_EMBED_MODEL,
         help="Sentence-transformer for node/query embeddings.",
     )
-    parser.add_argument("--count_question_max_chunks", type=int, default=0)
+    parser.add_argument("--count_question_max_chunks", type=int, default=20)
     parser.add_argument(
-        "--caption_batch_size",
-        type=int,
-        default=0,
-        help=(
-            "History caption batch size for the Hub-and-Spoke backward/"
-            "realtime path. Keep 0 for the baseline HLD/EPM/ASI behavior; "
-            ">0 is faster but can change memory captions and scores."
-        ),
+        "--caption_batch_size", type=int, default=4,
+        help="History caption batch size (default: 4); changing it can change captions.",
     )
     parser.add_argument("--max_samples_per_split", type=int, default=None)
     parser.add_argument(
@@ -1050,18 +1081,7 @@ def main() -> None:
         "--memory_mode",
         choices=list(MEMORY_MODE_CHOICES),
         default=None,
-        help=(
-            "hub_spoke: dhsm/hub_and_spoke.py, the non-provenance variant. "
-            "flat_caption: ablation storing each chunk's whole caption as one "
-            "retrieval unit (same captions and retrieval hyperparameters, no "
-            "hub-and-spoke organization). "
-            "incremental: dhsm/hub_and_spoke_incremental.py, the provenance-"
-            "tracking variant implementing Algorithm 2. Note that the "
-            "backward/realtime path only calls update(), so this does not "
-            "exercise its remove_chunks() removal path. "
-            "Defaults to incremental for both routing modes, so an A/B over "
-            "--routing isolates the gate; pass it explicitly to override."
-        ),
+        help="Memory implementation; defaults to entity_resolved with chunk-local ID repair.",
     )
     parser.add_argument(
         "--no_cooccurrence",
@@ -1088,14 +1108,57 @@ def main() -> None:
     parser.add_argument("--rec_interval_max_delta", type=int, default=2)
     parser.add_argument("--crr_interval_frames", type=int, default=16)
     parser.add_argument("--crr_interval_context_seconds", type=float, default=1.0)
-    parser.add_argument(
-        "--crr_no_force_first_no",
-        action="store_true",
-        help="Do not force the first CRR cutoff to No.",
-    )
+    add_crr_first_response_arguments(parser)
     args = parser.parse_args()
-    # --routing keyword implies the incremental (Algorithm 2) memory unless
-    # --memory_mode was given explicitly.
+    defaults = ovo_defaults(args.model_path)
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    if args.dynamic_top_k_max < 1:
+        parser.error("--dynamic_top_k_max must be positive.")
+    for name in ("sim_threshold", "memory_floor", "gate_strict_sim"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            parser.error(f"--{name} must be finite and between 0 and 1.")
+    if args.recent_frames_only < 1 or args.max_extraction_chunks < 1 or args.count_question_max_chunks < 1:
+        parser.error("Recent-frame and historical-caption budgets must be positive.")
+    if (not math.isfinite(args.fps) or not math.isfinite(args.chunk_duration)
+            or args.fps <= 0 or args.chunk_duration <= 0):
+        parser.error("--fps and --chunk_duration must be positive and finite.")
+    if args.extract_every_n_chunks < 1 or args.caption_batch_size < 0:
+        parser.error("Extraction stride must be positive and caption batch size nonnegative.")
+    args.answer_instruction_sha256 = (
+        hashlib.sha256(UNIFORM_ABSTENTION_INSTRUCTION.encode()).hexdigest()
+        if args.mcq_prompt_policy == MCQ_PROMPT_UNIFORM else None
+    )
+    # These environment variables change processor resolution. Record their
+    # effective overrides so paired runs and resume checks can compare them.
+    args.min_pixels = int(os.environ["MIN_PIXELS"]) if os.environ.get("MIN_PIXELS") else None
+    args.max_pixels = int(os.environ["MAX_PIXELS"]) if os.environ.get("MAX_PIXELS") else None
+    args.video_environment = {
+        key: os.environ.get(key)
+        for key in ("VIDEO_MAX_PIXELS", "FORCE_QWENVL_VIDEO_READER", "TORCHCODEC_NUM_THREADS")
+    }
+    args.runtime_versions = {}
+    for package in (
+        "torch", "torchvision", "transformers", "accelerate", "qwen-vl-utils",
+        "numpy", "pillow", "av", "decord", "torchcodec", "sentence-transformers",
+    ):
+        try:
+            args.runtime_versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            args.runtime_versions[package] = None
+    source_hash = hashlib.sha256()
+    source_files = sorted((PROJECT_ROOT / "dhsm").glob("*.py")) + [
+        PROJECT_ROOT / "experiments" / name
+        for name in ("evaluate_ovo.py", "ovo_bench.py", "ovo_protocol.py")
+    ]
+    for source_file in source_files:
+        source_hash.update(str(source_file.relative_to(PROJECT_ROOT)).encode() + b"\0")
+        source_hash.update(source_file.read_bytes())
+    args.evaluation_code_sha256 = source_hash.hexdigest()
+    # Factory and memory modules are covered by the dhsm/*.py source digest.
+    # Keyword routing defaults to the repaired entity-resolved memory.
     args.memory_mode = resolve_memory_mode(args.routing, args.memory_mode)
 
     accelerator = Accelerator(
@@ -1103,13 +1166,42 @@ def main() -> None:
     )
 
     import random
-    with open(args.anno_path) as handle:
-        annotations = json.load(handle)
+    annotation_bytes = Path(args.anno_path).read_bytes()
+    annotations = json.loads(annotation_bytes)
+    args.annotation_sha256 = hashlib.sha256(annotation_bytes).hexdigest()
+    for annotation in annotations:
+        if type(annotation.get("id")) is not int or annotation["id"] < 0:
+            raise ValueError("Annotation IDs must be nonnegative integers.")
+        if annotation.get("task") in BACKWARD_TASKS + REAL_TIME_TASKS:
+            mcq_query_cutoff(annotation)
+            build_mcq_prompt(annotation.get("question"), annotation.get("options"))
 
     active_splits = {s.strip().lower() for s in args.splits.split(",") if s.strip()}
     unknown_splits = active_splits - {"backward", "realtime", "forward"}
     if unknown_splits:
         raise SystemExit(f"Unknown --splits entries: {sorted(unknown_splits)}")
+    if args.history_mode == HISTORY_RECENT_ONLY and "forward" in active_splits:
+        raise SystemExit(
+            "--history_mode recent_only applies to MCQ tasks; "
+            "use --splits backward,realtime (or a subset), excluding forward."
+        )
+
+    # Every rank checks the same manifest independently before loading models.
+    # No rank waits at a barrier if another rejects incompatible old results.
+    ensure_result_protocol(
+        args.result_dir,
+        {
+            "benchmark": "ovo",
+            "config": vars(args),
+            "annotation_sha256": args.annotation_sha256,
+            "num_processes": accelerator.num_processes,
+        },
+    )
+    # Remove every stale marker before any rank can finish a resumed shard.
+    # Per-rank cleanup races with rank 0 checking other ranks' old markers.
+    if accelerator.is_main_process:
+        shard_io.clear_done_markers(args.result_dir, accelerator.num_processes)
+    accelerator.wait_for_everyone()
 
     backward_anno = [a for a in annotations if a["task"] in BACKWARD_TASKS]
     realtime_anno = [a for a in annotations if a["task"] in REAL_TIME_TASKS]
@@ -1141,10 +1233,12 @@ def main() -> None:
     accelerator.print(
         f"recent_frames={args.recent_frames_only}  "
         f"embed_model={args.embed_model}  sim_threshold={args.sim_threshold}  "
-        f"top_k={format_top_k(args.top_k)}  "
+        f"top_k={format_top_k(args.top_k, args.dynamic_top_k_max)}  "
         f"routing={args.routing}  "
+        f"mcq_prompt_policy={args.mcq_prompt_policy}  "
+        f"history_mode={args.history_mode}  "
         f"memory_mode={args.memory_mode}  "
-        f"gate_strict_sim={args.gate_strict_sim}  "
+        f"memory_floor={args.memory_floor}  gate_strict_sim={args.gate_strict_sim}  "
         f"caption_batch_size={args.caption_batch_size}  "
         f"expansion={'off' if args.no_expansion else 'on'}  "
         f"REC interval={args.rec_interval_frames}f  "
@@ -1167,6 +1261,7 @@ def main() -> None:
         embed_model=args.embed_model,
         sim_threshold=args.sim_threshold,
         top_k=args.top_k,
+        dynamic_top_k_max=args.dynamic_top_k_max,
         count_question_max_chunks=args.count_question_max_chunks,
         caption_batch_size=args.caption_batch_size,
         expand_retrieval=not args.no_expansion,
@@ -1198,8 +1293,6 @@ def main() -> None:
     done_marker = shard_io.done_path(
         args.result_dir, accelerator.process_index, accelerator.num_processes
     )
-    if os.path.exists(done_marker):
-        os.remove(done_marker)
     backward_results, realtime_results, forward_results, done_keys = load_checkpoint_state(
         ckpt_path
     )
@@ -1223,7 +1316,10 @@ def main() -> None:
                 args.recent_frames_only,
                 use_logits=args.use_logits,
                 routing=args.routing,
+                memory_floor=args.memory_floor,
                 gate_strict_sim=args.gate_strict_sim,
+                mcq_prompt_policy=args.mcq_prompt_policy,
+                history_mode=args.history_mode,
             )
             backward_results.append(result)
             done_keys.add(key)
@@ -1248,7 +1344,10 @@ def main() -> None:
                 args.recent_frames_only,
                 use_logits=args.use_logits,
                 routing=args.routing,
+                memory_floor=args.memory_floor,
                 gate_strict_sim=args.gate_strict_sim,
+                mcq_prompt_policy=args.mcq_prompt_policy,
+                history_mode=args.history_mode,
             )
             realtime_results.append(result)
             done_keys.add(key)
@@ -1271,6 +1370,9 @@ def main() -> None:
                 args.chunk_duration,
                 args.fps,
             )
+            result["routing_mode"] = args.routing
+            result["mcq_prompt_policy"] = args.mcq_prompt_policy
+            result["history_mode"] = args.history_mode
             forward_results.append(result)
             done_keys.add(key)
             shard_io.append_row(ckpt, result, key)
@@ -1306,25 +1408,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-'''
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 \
-  experiments/evaluate_ovo.py \
-  --model_path Qwen/Qwen2.5-VL-7B-Instruct \
-  --anno_path /data/xinru/dataset/data/ovo_bench/ovo_bench_new.json \
-  --chunked_dir /data/xinru/dataset/data/ovo_bench/chunked_videos \
-  --result_dir results/ovo/qwen2.5_4f_batch4_dynamic \
-  --recent_frames_only 4 \
-  --chunk_duration 1.0 \
-  --fps 1.0 \
-  --max_qa_tokens 256 \
-  --extract_every_n_chunks 1 \
-  --max_extraction_chunks 20 \
-  --sim_threshold 0.25 \
-  --top_k dynamic \
-  --use_logits \
-  --caption_batch_size 4 \
-  2>&1 | tee results/ovo/qwen2.5_4f_batch_4_dynamic.log
-
-'''

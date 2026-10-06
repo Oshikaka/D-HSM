@@ -1,39 +1,4 @@
-"""Incremental Hub-and-Spoke memory with per-chunk provenance.
-
-Implements Algorithm 2's removal path (line 2) as true incremental
-operations, per the rebuttal specification:
-
-  - Every hub/spoke keeps a supporter list of (chunk_id, timestamp)
-    observations; occurrence count and first/last-seen timestamps are
-    DERIVED from it, never maintained as free-running counters.
-  - Every co-occurrence edge keeps the set of active chunks in which the
-    two entities appeared together.
-  - remove_chunks(delta_minus): supporter entries from departed chunks are
-    removed; nodes/edges with no remaining support are deleted; surviving
-    spokes whose hub was deleted are re-attached to the most similar
-    remaining hub (cached embeddings — no re-encoding); temporal-action
-    chains are re-linked across deletions; timeline entries from removed
-    chunks are dropped.
-  - A chunk -> elements inverted index makes removal O(k) in the number of
-    observations the departing chunk contributed, independent of memory
-    size.
-  - Observations rejected by the node cap are kept in an overflow log and
-    re-admitted (in original observation order) when removals free space.
-
-Equivalence: after any sequence of update()/remove_chunks() calls, the
-memory state matches one assembled from scratch from the currently active
-chunks' captions (see verify_equivalence() and the __main__ self-test).
-Two documented approximations relative to a strict chronological rebuild:
-re-admission from overflow replays in original order but attaches against
-the CURRENT hub set, and embedding re-attachment considers remaining hubs
-first observed no later than the spoke (chronological constraint), which
-matches the rebuild in all but pathological interleavings.
-
-Retrieval mirrors HubAndSpokeMemory.retrieve (same scoring, dynamic
-cutoff, hub-and-spoke expansion, and rendering blocks). The OVO-REC
-counting-aggregate and task-state extensions are intentionally not
-duplicated here.
-"""
+"""Incremental Hub-and-Spoke memory with per-chunk provenance."""
 
 from __future__ import annotations
 
@@ -48,6 +13,8 @@ from .hub_and_spoke import (
     NO_MATCHING_NODE_SIGNAL,
     DEFAULT_EMBED_MODEL,
     SIM_THRESHOLD,
+    DYNAMIC_TOP_K_MAX,
+    _validate_dynamic_top_k_max,
     RetrievalResult,
     HubAndSpokeMemory,
     HubAndSpokeEvaluator,
@@ -99,11 +66,13 @@ class IncrementalHubAndSpokeMemory:
         sim_threshold: float = SIM_THRESHOLD,
         max_nodes: int = MAX_NODES,
         embed_device: str = "cpu",
+        dynamic_top_k_max: int = DYNAMIC_TOP_K_MAX,
     ) -> None:
         self._embed_model_name = embed_model
         self._embed_device = embed_device
         self.sim_threshold = sim_threshold
         self.max_nodes = max_nodes
+        self.dynamic_top_k_max = _validate_dynamic_top_k_max(dynamic_top_k_max)
 
         self.nodes: dict[int, IncNode] = {}
         self._next_id = 0
@@ -163,7 +132,7 @@ class IncrementalHubAndSpokeMemory:
         return None
 
     # ------------------------------------------------------------------
-    # Additions (Alg. 2, lines 3-24)
+    # Additions (Alg. 2)
     # ------------------------------------------------------------------
 
     def _admit(
@@ -272,7 +241,7 @@ class IncrementalHubAndSpokeMemory:
                 self.co_edges.setdefault(frozenset((a, b)), set()).add(chunk_id)
 
     # ------------------------------------------------------------------
-    # Removal (Alg. 2, line 2) — the incremental realization
+    # Removal (Alg. 2) — the incremental realization
     # ------------------------------------------------------------------
 
     def remove_chunks(self, removed: set[int]) -> None:
@@ -580,4 +549,5 @@ class IncrementalHubAndSpokeEvaluator(HubAndSpokeEvaluator):
             embed_model=self.embed_model,
             embed_device=self.embed_device,
             sim_threshold=self.sim_threshold,
+            dynamic_top_k_max=self.dynamic_top_k_max,
         )

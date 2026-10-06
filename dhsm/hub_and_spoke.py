@@ -1,16 +1,4 @@
-"""
-Hub-and-Spoke: caption-driven streaming video memory with semantic retrieval.
-
-Main pieces:
-  - Stable IDs for OBJECTS (O<N>) and PEOPLE (P<N>) merge entities across chunks
-  - 3-frame caption (first/mid/last) instead of 1 frame
-  - Stem-based keyword matching for the timeline and action index
-  - Two new edge types: co_entities (intra-chunk) and next_action (per-entity)
-  - Default embedder is BAAI/bge-small-en-v1.5
-  - Count-question pipeline: activity-aware caption prompt, action_log of every
-    chunk-emission for the embedding fallback, focus extraction to strip the
-    REC-template scaffolding before stem matching
-"""
+"""Hub-and-Spoke: caption-driven streaming video memory with semantic retrieval"""
 
 from __future__ import annotations
 
@@ -50,6 +38,13 @@ DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 DYNAMIC_TOP_K_MAX = 12
 _DYNAMIC_TOP_K_MODES = {"dynamic", "auto", "adaptive"}
 
+
+def _validate_dynamic_top_k_max(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("dynamic_top_k_max must be a positive integer")
+    return value
+
+
 _TEMPORAL_KEYWORDS = {
     "after", "before", "then", "next", "when", "order", "sequence",
     "first", "last", "earlier", "later", "previously", "follow",
@@ -64,21 +59,14 @@ _RECENCY_PHRASES = (
 )
 _RECENT_EVENTS_K = 6
 
-# Counting tasks (OVO REC, etc.). Detected by surface phrase; when True,
-# build_memory_from_chunks() bypasses max_extraction_chunks (Fix A) and
-# retrieve() emits a [Counting Aggregate] section (Fix B).
 _COUNT_PHRASES = (
     "how many times",
     "how often",
     "number of times",
     "count how many",
-    "how many",        # weaker but still useful; later filtered by stem overlap
+    "how many",       
 )
 
-# Raw stop words for count-question filtering — pronouns, auxiliaries, and
-# generic count-question scaffolding.  We stem these below so that "times" and
-# "time" both map to the same filtered form regardless of which inflection is
-# in the question or stop list.
 _COUNT_STOP_WORDS_RAW = (
     "they", "them", "their", "this", "that", "these", "those",
     "what", "when", "where", "which", "while", "until", "after",
@@ -146,7 +134,6 @@ Hard rules:
   P1 and O1 for them now."""
 
 
-# Caption section header → node type stored in memory.
 _SECTION_TO_TYPE: dict[str, str] = {
     "OBJECTS": "entity",
     "PEOPLE":  "entity",
@@ -181,13 +168,7 @@ class RetrievalResult:
     matched_nodes: bool
     signal: str | None = None
     hit_count: int = 0
-    # Cosine scores behind the decision.  Logged so that a sweep over the
-    # gate's evidence floor can be replayed offline from one evaluation run,
-    # instead of costing a full run per candidate threshold.
-    #   hit_sims       scores that survived every filter (base threshold,
-    #                  dynamic top-k, and the gate's min_evidence_sim),
-    #                  descending.
-    #   candidate_sims the top-k scores before any of those filters.
+    # Cosine scores behind the decision. 
     hit_sims: tuple[float, ...] = ()
     candidate_sims: tuple[float, ...] = ()
 
@@ -216,14 +197,7 @@ def _fmt_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-# Crude stemmer — strip common English suffixes. Good enough for keyword
-# overlap without pulling in nltk.
-#
-# After stripping -ing/-ed, undouble a trailing CVC-style doubled consonant
-# so "chopping" → "chopp" → "chop". This may over-stem a few words
-# (e.g., "kissing" → "kiss" → "kis"), but consistency is what matters here:
-# question and caption both pass through the same stemmer, so as long as the
-# mapping is deterministic the keyword overlap still fires.
+# Crude stemmer — strip common English suffixes. Good enough for keyword overlap without pulling in nltk.
 _STEM_SUFFIX_RE = re.compile(r"(ings?|ied|ed|es|s)$", re.IGNORECASE)
 _STEM_UNDOUBLE_SUFFIXES = {"ing", "ings", "ed", "ied"}
 _STEM_RESTORE_E_SUFFIXES = {"ing", "ings", "ed", "es"}
@@ -271,8 +245,6 @@ def _keywords(text: str) -> set[str]:
     return {_stem(w) for w in re.findall(r"\b\w{4,}\b", text.lower())}
 
 
-# Pre-stem the count stop list so e.g. "times" and "time" both filter out,
-# and "diving"/"dive" both map to the same form regardless of which side.
 _COUNT_STOP_STEMS = frozenset(_stem(w) for w in _COUNT_STOP_WORDS_RAW)
 
 
@@ -281,10 +253,7 @@ def _is_count_question(question: str) -> bool:
     return any(p in ql for p in _COUNT_PHRASES)
 
 
-# Pull the activity phrase out of a count question.  OVO's REC template wraps
-# the actual question in ~80 words of instructions; without this extraction
-# every retrieval inherits stems like "response", "certain", "single", which
-# pollute both stem and embedding matching.
+# Pull the activity phrase out of a count question.
 _COUNT_FOCUS_RE = re.compile(
     r"how many times\s+"
     r"(?:do(?:es)?|did|has|have|are|is|will)?\s*"
@@ -294,15 +263,8 @@ _COUNT_FOCUS_RE = re.compile(
 )
 
 def make_activity_aware_caption_prompt(activity: str) -> str:
-    """Augment CAPTION_PROMPT with a count-focused activity directive.
+    # Augment CAPTION_PROMPT with a count-focused activity directive.
 
-    For OVO REC the activity itself often never appears in a free-form VLM
-    caption (a diving video gets captioned as "swims/climbs/rides wave"),
-    so we tell the VLM what to look for AND constrain when it may use the
-    activity word.  The peak-only rule is critical: without it the VLM tends
-    to label preparation, transition and aftermath frames as the activity
-    too, inflating counts 2-4×.
-    """
     a = activity.strip().strip(".?! ").lower()
     suffix = (
         "\n\n"
@@ -346,20 +308,8 @@ _COUNT_FOCUS_TRAILING_SCAFFOLD = re.compile(
 
 
 def _extract_count_focus(question: str) -> str:
-    """Return the activity phrase from a count question.
+    # Return the activity phrase from a count question.
 
-    OVO's REC template has two "how many times" occurrences — one in the
-    instructions ("count how many times have different people…") and one in
-    the actual question ("How many times did they dive?").  If the template
-    marker "answer the following question:" is present, we constrain the
-    search to text AFTER it.  Otherwise we use the last match, which is
-    almost always the interrogative sentence.
-
-    We then strip common temporal scaffolding that StreamingBench Counting
-    questions tend to use ("in total ...", "... so far"), so the resulting
-    focus is closer to a bare activity description that the VLM can mirror
-    back in the ACTIONS line.
-    """
     marker = "answer the following question:"
     idx = question.lower().rfind(marker)
     haystack = question[idx + len(marker):] if idx >= 0 else question
@@ -381,55 +331,14 @@ def _extract_count_focus(question: str) -> str:
 
 
 def _content_stems(text: str) -> set[str]:
-    """Question/action content stems with stop words removed.
+    # Question/action content stems with stop words removed.
 
-    The raw word filter `\\w{4,}` in `_keywords` already requires ≥4 characters
-    BEFORE stemming, so legitimate short verb stems like "div" (from "diving")
-    or "tim" (filtered as stop) survive intake.  We then drop only stop-set
-    members and very-short residuals (len < 3, almost always noise like "do").
-    """
     return {s for s in _keywords(text) if len(s) >= 3 and s not in _COUNT_STOP_STEMS}
 
 
 # ---------------------------------------------------------------------------
 # Embedder factory
 # ---------------------------------------------------------------------------
-
-class _TransformersEmbedder:
-    """Mean-pooled AutoModel fallback when sentence-transformers is unavailable."""
-
-    def __init__(self, model_name: str, device: str = "cpu") -> None:
-        from transformers import AutoTokenizer, AutoModel
-        import torch
-        if "/" not in model_name:
-            model_name = f"sentence-transformers/{model_name}"
-        self._tok = AutoTokenizer.from_pretrained(model_name)
-        self._mdl = AutoModel.from_pretrained(model_name).to(device)
-        self._mdl.eval()
-        self._device = device
-        self._torch = torch
-
-    def encode(self, texts, normalize_embeddings: bool = True,
-               batch_size: int = 64, **_) -> np.ndarray:
-        import torch
-        all_embs: list[np.ndarray] = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            enc = self._tok(batch, padding=True, truncation=True,
-                            max_length=128, return_tensors="pt")
-            enc = {k: v.to(self._device) for k, v in enc.items()}
-            with torch.inference_mode():
-                out = self._mdl(**enc)
-            tok_emb = out.last_hidden_state
-            mask = enc["attention_mask"].unsqueeze(-1).float()
-            emb = (tok_emb * mask).sum(1) / mask.sum(1)
-            emb = emb.cpu().float().numpy()
-            if normalize_embeddings:
-                norms = np.linalg.norm(emb, axis=1, keepdims=True)
-                emb = emb / np.maximum(norms, 1e-8)
-            all_embs.append(emb)
-        return np.concatenate(all_embs, axis=0)
-
 
 _EMBEDDER_CACHE: dict[tuple, Any] = {}
 
@@ -439,13 +348,13 @@ def _load_embedder(model_name: str, device: str = "cpu"):
         return _EMBEDDER_CACHE[key]
     try:
         from sentence_transformers import SentenceTransformer
-        # bge-small / bge-m3 / e5 ship under their own org, so don't prepend
-        # sentence-transformers/ for those; only do that for the legacy
-        # MiniLM-style short names with no slash.
-        name = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
-        embedder = SentenceTransformer(name, device=device)
-    except Exception:
-        embedder = _TransformersEmbedder(model_name, device=device)
+    except ImportError as exc:
+        raise RuntimeError(
+            "sentence-transformers is required to preserve the embedding model's "
+            "pooling configuration. Install requirements.txt before evaluation."
+        ) from exc
+    name = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+    embedder = SentenceTransformer(name, device=device)
     _EMBEDDER_CACHE[key] = embedder
     return embedder
 
@@ -471,53 +380,25 @@ class HubAndSpokeMemory:
         expand_co_occurrence: bool = True,
         expand_next_action: bool = True,
         merge_spokes: bool = True,
+        dynamic_top_k_max: int = DYNAMIC_TOP_K_MAX,
     ) -> None:
         self._embed_model_name = embed_model
         self._embed_device = embed_device
         self.sim_threshold = sim_threshold
         self.max_nodes = max_nodes
         # Ablation switches:
-        #   expand_retrieval=False  — no expansion at all (only direct hits).
-        #   expand_co_occurrence=False — expansion keeps hub↔spoke links but
-        #     drops co-occurrence edges (entity → co-located entities).
-        #   expand_next_action=False  — expansion drops next-action chains.
-        #   merge_spokes=False — repeated spoke facts are inserted as new
-        #     nodes instead of merging into one node (entity hubs still merge
-        #     by identifier; disabling that would remove the hub concept).
         self.expand_retrieval = expand_retrieval
         self.expand_co_occurrence = expand_co_occurrence
         self.expand_next_action = expand_next_action
         self.merge_spokes = merge_spokes
-
+        self.dynamic_top_k_max = _validate_dynamic_top_k_max(dynamic_top_k_max)
         self.nodes: list[TextNode] = []
         self._dedup: dict[str, int] = {}
         self.timeline: list[tuple[float, str]] = []
-
-        # Per-stem timestamp index for action nodes — populated EVERY time an
-        # action is observed (whether the node is new or merged), so an action
-        # repeated across N chunks contributes N entries even when dedup
-        # collapses it into a single node.  Used by retrieve() for counting
-        # tasks (Fix B).
         self.action_index: dict[str, list[tuple[float, str]]] = {}
-
-        # Per-observation log of (timestamp, text, action_node_idx).  Each
-        # row corresponds to ONE chunk's emission of the action — unlike
-        # `self.nodes`, this is NOT deduplicated, so we can recover the true
-        # number of chunks an action appeared in.  The `node_idx` is filled in
-        # by `update()` AFTER `_add_or_merge_node` resolves the node.  Used
-        # for the embedding-based count fallback (when the question's verb
-        # never literally appears in any caption — e.g., "diving" question
-        # but VLM only says "standing on board / climbing platform").
         self.action_log: list[tuple[float, str, int]] = []
-
-        # Stable lookup for task-state nodes.  The state itself lives in
-        # `self.nodes` as node_type="task_state"; this index only lets us
-        # update the same node across streaming cutoffs.
         self._task_state_index: dict[str, int] = {}
-
-        # Per-entity action chain head→tail; updated as we add new actions.
         self._last_action_per_entity: dict[int, int] = {}
-
         self._embedder = None
 
     # ------------------------------------------------------------------
@@ -549,7 +430,7 @@ class HubAndSpokeMemory:
         return None
 
     def _find_entity_by_id(self, stable_id: str) -> int | None:
-        """Return the existing entity index for a P<N>/O<N> id, or None."""
+        # Return the existing entity index for a P<N>/O<N> id, or None.
         key = f"id:{stable_id}"
         return self._dedup.get(key)
 
@@ -558,16 +439,8 @@ class HubAndSpokeMemory:
         question: str,
         embed_sim_threshold: float = 0.60,
     ) -> str | None:
-        """Return a [Counting Aggregate] block for count-style questions.
+        # Return a [Counting Aggregate] block for count-style questions.
 
-        Two paths, in order:
-          1. STEM path — exact stem overlap between focus and action_index.
-             Cheap; catches "chops"/"chopping"/"chopped" ↔ question "chop".
-          2. EMBEDDING fallback — cosine similarity between focus and the
-             action observations in `self.action_log`.  Catches paraphrase
-             cases ("diving" question ↔ "leaping off platform" caption) that
-             stem matching cannot bridge.
-        """
         if not self.action_log and not self.action_index:
             return None
 
@@ -601,10 +474,7 @@ class HubAndSpokeMemory:
         if not self.action_log:
             return None
 
-        # Embed once.
         f_emb = self._embed([focus])[0]
-
-        # Pre-compute cosine for every action node.
         action_idxes = [i for i, n in enumerate(self.nodes) if n.node_type == "action"]
         if not action_idxes:
             return None
@@ -612,11 +482,7 @@ class HubAndSpokeMemory:
         sims = embs @ f_emb
         sim_lookup = {idx: float(sims[i]) for i, idx in enumerate(action_idxes)}
 
-        # Reduce to ONE max-similarity per chunk timestamp.  This prevents the
-        # same recurring action node (e.g., "P1 stands", which repeats across
-        # many chunks) from inflating the count by N when it only weakly
-        # matches the focus.  A chunk counts only if some action observed in
-        # it is genuinely close to the focus.
+        # Reduce to ONE max-similarity per chunk timestamp.  
         chunk_max: dict[float, tuple[float, str]] = {}    # ts → (sim, text)
         for ts, text, idx in self.action_log:
             sim = sim_lookup.get(idx)
@@ -707,21 +573,12 @@ class HubAndSpokeMemory:
         if not text or text.upper() in {"NONE", "N/A", "-"} or len(text) < 5:
             return None
 
-        # ---- action index — record EVERY observation, even on merge ----
-        # We do this BEFORE the dedup short-circuit so that the same action
-        # repeated across multiple chunks contributes one entry per chunk.
-        # The flat node `count` field tracks dedup-merge multiplicity, but it
-        # only fires when the caption text matches exactly; small wording
-        # drift fragments the count.  The action_index is robust to drift
-        # because it indexes by stem, not full text.
+
         if node_type == "action":
             for stem in _content_stems(text):
                 self.action_index.setdefault(stem, []).append((timestamp, text))
 
         # ---- dedup key ----
-        # Entities (PEOPLE/OBJECTS) with a stable P<N>/O<N> id merge by id;
-        # the trailing ":<action>" tail (only used by PEOPLE) is dropped so the
-        # entity hub stays a clean identifier — actions live in their own nodes.
         sid = self._stable_id(text) if node_type == "entity" else None
         if sid is not None:
             text = text.split(":", 1)[0].strip()
@@ -740,9 +597,7 @@ class HubAndSpokeMemory:
 
         emb = self._embed([text])[0]
 
-        # Entity link for spoke nodes.  Prefer ID-based linking when the spoke
-        # text references a P<N>/O<N> we've already seen; fall back to cosine
-        # similarity for cases the VLM forgot to ID.
+        # Entity link for spoke nodes.
         entity_idx: int | None = None
         if node_type not in ("entity", "text_ocr"):
             for ref_id in self._referenced_ids(text):
@@ -800,9 +655,6 @@ class HubAndSpokeMemory:
                 if node_type == "entity":
                     chunk_entity_idxes.add(idx)
                 if current_section == "ACTIONS":
-                    # One row per chunk-emission for the embedding-based
-                    # count fallback (action_index is stem-indexed and misses
-                    # synonym/paraphrase cases like "diving" vs "leaping").
                     self.action_log.append((timestamp, item, idx))
                 if current_section == "EVENT":
                     self.timeline.append((timestamp, item))
@@ -891,7 +743,9 @@ class HubAndSpokeMemory:
         if isinstance(top_k, str):
             mode = top_k.strip().lower()
             if mode in _DYNAMIC_TOP_K_MODES:
-                return DYNAMIC_TOP_K_MAX, True
+                return _validate_dynamic_top_k_max(
+                    getattr(self, "dynamic_top_k_max", DYNAMIC_TOP_K_MAX)
+                ), True
             try:
                 top_k_val = int(mode)
             except ValueError as exc:
@@ -935,15 +789,8 @@ class HubAndSpokeMemory:
         return_result: bool = False,
         min_evidence_sim: float | None = None,
     ) -> str | RetrievalResult:
-        """Retrieve a question-relevant memory subset.
+        # Retrieve a question-relevant memory subset.
 
-        ``min_evidence_sim`` raises the similarity floor for this call only.
-        The keyword gate (see ``dhsm/retrieval_gate.py``) sets it for questions
-        whose wording does not reveal whether history is needed, so that
-        history is injected only when memory holds a closely matching entry.
-        The ``[Counting Aggregate]`` and ``[Most recent events]`` bypasses
-        below carry their own evidence tests and are unaffected.
-        """
         if not self.nodes:
             result = RetrievalResult(
                 context="",
@@ -972,12 +819,7 @@ class HubAndSpokeMemory:
             ]
             if dynamic_top_k:
                 ranked_hits = self._apply_dynamic_top_k(ranked_hits, base_threshold=thr)
-            # Applied AFTER the cutoff, never by raising `thr`: the elbow
-            # detector compares the best gap against the median gap, so
-            # truncating the candidate list first inflates the median and can
-            # suppress a cutoff that would otherwise fire -- letting the
-            # stricter setting return MORE nodes than the lenient one. Post-
-            # filtering keeps the strict result a subset of the lenient one.
+            
             if min_evidence_sim is not None:
                 ranked_hits = [h for h in ranked_hits if h[1] >= float(min_evidence_sim)]
             hit_idxes = {idx for idx, _ in ranked_hits}
@@ -992,9 +834,6 @@ class HubAndSpokeMemory:
 
         is_count_q = _is_count_question(question)
 
-        # Counting questions get a guaranteed pass even if no node passes the
-        # cosine threshold — the [Counting Aggregate] section below is the
-        # whole point of the call.
         if not hit_idxes and not (is_recency_q and self.timeline) \
                 and not (is_count_q and self.action_index):
             result = RetrievalResult(
@@ -1008,9 +847,6 @@ class HubAndSpokeMemory:
             return result if return_result else result.context
 
         # --- Hub-and-spoke expansion ---
-        # Hub→spokes, spoke→hub (existing); plus:
-        #   entity → co-occurring entities (1 hop)
-        #   action → next_action chain (up to 2 hops forward)
         expanded: set[int] = set(hit_idxes)
         if self.expand_retrieval:
             for idx in list(hit_idxes):
@@ -1036,9 +872,7 @@ class HubAndSpokeMemory:
 
         parts: list[str] = []
 
-        # Counting aggregate — placed FIRST so it dominates the prompt for
-        # count questions, where the rest of the context tends to mislead the
-        # VLM toward under-counting.
+
         if is_count_q:
             agg = self._format_count_aggregate(question)
             if agg:
@@ -1086,10 +920,7 @@ class HubAndSpokeMemory:
 
             parts.append("\n".join(lines))
 
-        # Unlinked facts.  A spoke whose hub is not part of the expanded set
-        # (only possible when expand_retrieval=False, since expansion always
-        # pulls in the hub) is rendered here so directly-hit evidence is
-        # never silently dropped.
+
         unlinked = [
             self.nodes[i] for i in expanded
             if self.nodes[i].node_type not in ("entity", "text_ocr")
@@ -1111,7 +942,7 @@ class HubAndSpokeMemory:
         if ocr_nodes:
             parts.append("[Screen Text]\n" + "\n".join(f'  • "{n.text}"' for n in ocr_nodes))
 
-        # Timeline (temporal-reasoning questions); stem-aware filter
+        # Timeline
         has_temporal_q = bool(q_keyword_stems & {_stem(w) for w in _TEMPORAL_KEYWORDS})
         has_event_nodes = any(
             self.nodes[i].node_type in ("action", "event") for i in expanded
@@ -1168,12 +999,7 @@ class HubAndSpokeMemory:
 
 
 class FlatCaptionMemory:
-    """Structure-ablation baseline: same captions, no hub-and-spoke organization.
-
-    Each chunk's ENTIRE caption is one retrieval unit. Retrieval uses the same
-    embedder, similarity threshold, and dynamic-cutoff rule as
-    HubAndSpokeMemory, so the only variable versus D-HSM is how the textual
-    history is organized (flat blocks vs entity-centered typed nodes)."""
+    # Structure-ablation baseline: same captions, no hub-and-spoke organization.
 
     def __init__(
         self,
@@ -1181,11 +1007,13 @@ class FlatCaptionMemory:
         sim_threshold: float = SIM_THRESHOLD,
         max_nodes: int = MAX_NODES,
         embed_device: str = "cpu",
+        dynamic_top_k_max: int = DYNAMIC_TOP_K_MAX,
     ) -> None:
         self._embed_model_name = embed_model
         self._embed_device = embed_device
         self.sim_threshold = sim_threshold
         self.max_nodes = max_nodes
+        self.dynamic_top_k_max = _validate_dynamic_top_k_max(dynamic_top_k_max)
         self.captions: list[tuple[float, str]] = []
         self._embeddings: list[np.ndarray] = []
         self._embedder = None
@@ -1289,6 +1117,7 @@ class HubAndSpokeEvaluator:
         expand_co_occurrence: bool = True,
         expand_next_action: bool = True,
         merge_spokes: bool = True,
+        dynamic_top_k_max: int = DYNAMIC_TOP_K_MAX,
     ) -> None:
         self.qa = qa_model
         self.recent_frames = recent_frames
@@ -1302,13 +1131,8 @@ class HubAndSpokeEvaluator:
         self.expand_co_occurrence = expand_co_occurrence
         self.expand_next_action = expand_next_action
         self.merge_spokes = merge_spokes
-        # 0 = unlimited; non-zero overrides max_extraction_chunks for count
-        # questions, which suffer most from chunk sub-sampling.
+        self.dynamic_top_k_max = _validate_dynamic_top_k_max(dynamic_top_k_max)
         self.count_question_max_chunks = count_question_max_chunks
-        # 0 = legacy per-chunk caption.  >0 triggers a pre-caption pass that
-        # batches `caption_batch_size` chunks per VLM call before memory
-        # is built; captions are stashed on each chunk and consumed during
-        # the streaming/build loop.
         self.caption_batch_size = int(caption_batch_size)
         self.last_retrieval: RetrievalResult | None = None
 
@@ -1331,8 +1155,6 @@ class HubAndSpokeEvaluator:
         chunk_ts = (chunk.start_time + chunk.end_time) / 2.0
         cached = getattr(chunk, "_pre_caption", None)
         if cached is not None:
-            # Either a real caption string or the sentinel "" we set for
-            # chunks that came back blank — never re-run the VLM either way.
             return (cached or None), chunk_ts
         if not chunk.frames:
             return None, 0.0
@@ -1340,11 +1162,6 @@ class HubAndSpokeEvaluator:
         return caption, chunk_ts
 
     def _pre_caption_chunks(self, chunks_to_caption, caption_prompt: str) -> None:
-        """Batch-caption a list of chunks and stash each result on the chunk
-        (``chunk._pre_caption``).  Falls back to per-chunk captioning when
-        ``caption_batch_size`` is not set (>0) or when only a single chunk
-        is passed.  Order of chunks is preserved so the caller can still
-        rely on chronological ``memory.update`` calls afterwards."""
         bs = max(0, int(getattr(self, "caption_batch_size", 0)))
         if bs <= 0:
             return
@@ -1368,11 +1185,11 @@ class HubAndSpokeEvaluator:
     # ------------------------------------------------------------------
 
     def _make_memory(self):
-        """Memory factory; FlatCaptionEvaluator overrides this."""
         return HubAndSpokeMemory(
             embed_model=self.embed_model,
             embed_device=self.embed_device,
             sim_threshold=self.sim_threshold,
+            dynamic_top_k_max=self.dynamic_top_k_max,
             expand_retrieval=self.expand_retrieval,
             expand_co_occurrence=self.expand_co_occurrence,
             expand_next_action=self.expand_next_action,
@@ -1404,9 +1221,6 @@ class HubAndSpokeEvaluator:
             if id(c) not in sampled_ids:
                 c.frames = []
 
-        # Pre-caption the strided set in one batched pass so each chunk's
-        # caption is ready before we touch memory. Cheap no-op when
-        # caption_batch_size is 0.
         self._pre_caption_chunks(strided, caption_prompt)
 
         for chunk in strided:
@@ -1438,34 +1252,9 @@ class HubAndSpokeEvaluator:
         use_logits: bool = True,
         num_options: int = 4,
     ) -> list[tuple[int, str | None, dict]]:
-        """Process `chunks` in time order, advance memory until each
-        sub-test's `realtime` cutoff, then answer with the current memory.
-
-        Captioning is *delayed* by one recent-frame window: a chunk is only
-        captioned (and merged into memory) once it has been pushed OUT of
-        the rolling buffer of the last ``recent_frames`` chunks.  This mirrors
-        the non-streaming behaviour where ``chunks[:-window]`` enter memory
-        and ``chunks[-window:]`` only contribute as direct visual input.
-        Without this delay the activity-aware caption prompt tends to also
-        label preparation/aftermath chunks as the activity, inflating counts.
-
-        Args:
-            chunks: pre-decoded chunks of the LONGEST sub-test video, in
-                ascending time order.
-            sub_tests: list of (orig_idx, test_info_dict); must be sorted by
-                ``test_info_dict["realtime"]`` ascending.
-            prompt_for_sub: callable(orig_idx) -> question string.
-            use_logits: route the final answer through MCQ logit scoring.
-
-        Returns:
-            list of (orig_idx, response, metadata) tuples, in the order of
-            sub_tests.  Caller is responsible for slotting these back into
-            the anno by orig_idx.
-        """
+        
         memory = self._make_memory()
 
-        # All sub-tests of one OVO anno share the same activity, so picking
-        # the caption prompt off any one of them is fine.
         caption_prompt = (
             self._caption_prompt_for(prompt_for_sub(sub_tests[0][0]))
             if sub_tests
@@ -1473,17 +1262,9 @@ class HubAndSpokeEvaluator:
         )
 
         window = max(1, self.recent_frames)
-        # Rolling buffer of the LAST `window` chunks that have arrived but
-        # have not yet been captioned.  Chunks here contribute frames at
-        # answer time (direct visual input) but their actions do not yet
-        # affect memory.
         recent_buffer: list = []
         captioned_count = 0
 
-        # Pre-caption every chunk that will eventually be evicted into the
-        # memory. Eligible = end_time within the last sub-test's cutoff;
-        # the last `window` of those will sit in the final recent_buffer
-        # and never get captioned, so skip them.
         if self.caption_batch_size > 0 and sub_tests:
             max_cutoff = max(ti["realtime"] for _, ti in sub_tests)
             eligible = [c for c in chunks if c.end_time <= max_cutoff]
@@ -1508,9 +1289,6 @@ class HubAndSpokeEvaluator:
             cutoff = ti["realtime"]
             t0 = time.perf_counter()
 
-            # Slide chunks up to (and including) the cutoff into the buffer.
-            # Each push that overflows the window evicts the oldest chunk,
-            # which is captioned at that moment and folded into memory.
             while pending is not None and pending.end_time <= cutoff:
                 recent_buffer.append(pending)
                 while len(recent_buffer) > window:
@@ -1537,9 +1315,7 @@ class HubAndSpokeEvaluator:
             }
             results.append((orig_idx, response, meta))
 
-        # Anything still left in the buffer after the last cutoff is dropped
-        # without being captioned — those chunks were only ever "recent" for
-        # some sub-test that has already been answered.
+
         for chunk in recent_buffer:
             chunk.frames = []
 
@@ -1556,6 +1332,7 @@ class HubAndSpokeEvaluator:
         question: str,
         include_no_match_signal: bool = False,
         min_evidence_sim: float | None = None,
+        answer_instruction: str | None = None,
     ) -> str:
         retrieval = memory.retrieve(
             question,
@@ -1567,6 +1344,8 @@ class HubAndSpokeEvaluator:
         full_question = self._question_with_retrieval(
             question, retrieval, include_no_match_signal=include_no_match_signal
         )
+        if answer_instruction:
+            full_question = f"{answer_instruction}\n\n{full_question}"
         return self.qa.generate_from_frames(recent_frames, full_question)
 
     def answer_with_memory_mcq(
@@ -1577,6 +1356,7 @@ class HubAndSpokeEvaluator:
         num_options: int = 4,
         include_no_match_signal: bool = False,
         min_evidence_sim: float | None = None,
+        answer_instruction: str | None = None,
     ) -> str:
         retrieval = memory.retrieve(
             question,
@@ -1588,6 +1368,8 @@ class HubAndSpokeEvaluator:
         full_question = self._question_with_retrieval(
             question, retrieval, include_no_match_signal=include_no_match_signal
         )
+        if answer_instruction:
+            full_question = f"{answer_instruction}\n\n{full_question}"
         return self.qa.score_mcq_from_frames(recent_frames, full_question, num_options=num_options)
 
     def answer_with_graph(
@@ -1645,4 +1427,5 @@ class FlatCaptionEvaluator(HubAndSpokeEvaluator):
             embed_model=self.embed_model,
             embed_device=self.embed_device,
             sim_threshold=self.sim_threshold,
+            dynamic_top_k_max=self.dynamic_top_k_max,
         )

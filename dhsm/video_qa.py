@@ -1,12 +1,9 @@
-"""Qwen2.5-VL question answering over a window of decoded video frames.
-
-Benchmark-agnostic: decoding, prompting, logit scoring and the token/latency
-accounting.  Benchmark-specific prompts and scoring live with the evaluators.
-"""
+"""Qwen2.5-VL question answering over a window of decoded video frames."""
 
 from __future__ import annotations
 
 import os
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -41,8 +38,8 @@ class EvalChunk:
 class RecentWindowQAModel:
     """Minimal Qwen-VL wrapper for the recent-window recency baseline.
 
-    Qwen2.5-VL keeps one ``<|vision_start|>...<|vision_end|>`` block per frame.
-    Qwen3-VL overrides this path with the single-block cached builder.
+    Qwen2.5-VL and Qwen3-VL both use the processor's native multimodal inputs,
+    including the modality IDs needed for M-RoPE and Qwen3 DeepStack features.
     """
 
     def __init__(
@@ -196,7 +193,7 @@ class RecentWindowQAModel:
 
     @torch.inference_mode()
     def _generate_from_model_inputs(self, prompt_length: int, **generate_kwargs: Any) -> str:
-        """Run generation from prepared model inputs and decode only new tokens."""
+        # Run generation from prepared model inputs and decode only new tokens.
         t0 = time.perf_counter()
         streamer = _TTFTStreamer(t0)
         generated_ids = self.model.generate(
@@ -224,7 +221,7 @@ class RecentWindowQAModel:
 
     @torch.inference_mode()
     def generate_text_only(self, prompt: str, max_new_tokens: int = 8) -> str:
-        """Text-only generation (no images). Used for lightweight classification."""
+        # Text-only generation (no images). Used for lightweight classification.
         text_device = self._get_text_input_device()
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         inputs = self.processor.apply_chat_template(
@@ -246,7 +243,7 @@ class RecentWindowQAModel:
     def _score_mcq_logits_from_inputs(
         self, prompt_length: int, num_options: int = 4, **fwd_kwargs: Any
     ) -> str:
-        """Single forward pass; pick the option whose first-token logit is highest."""
+        # Single forward pass; pick the option whose first-token logit is highest.
         tokenizer = self.processor.tokenizer
         option_ids = [
             tokenizer.encode(chr(65 + i), add_special_tokens=False)[0]
@@ -262,7 +259,8 @@ class RecentWindowQAModel:
     def score_mcq_from_frames(
         self, frames: list[Image.Image], question: str, num_options: int = 4
     ) -> str:
-        """Logit-based MCQ scoring for Qwen2.5-VL (eliminates position bias)."""
+        # Score MCQ letters using the model's native multimodal inputs.
+        """Score MCQ letters using the model's native multimodal inputs."""
         visual_device = self._get_visual_device()
         text_device = self._get_text_input_device()
 
@@ -289,11 +287,13 @@ class RecentWindowQAModel:
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            **({"mm_token_type_ids": inputs["mm_token_type_ids"].to(text_device)}
+               if "mm_token_type_ids" in inputs else {}),
         )
 
     @torch.inference_mode()
     def generate_from_frames(self, frames: list[Image.Image], question: str) -> str:
-        """Generate with the model's native multimodal path for Qwen2.5-VL."""
+        # Generate with the model's native multimodal path.
         visual_device = self._get_visual_device()
         text_device = self._get_text_input_device()
 
@@ -322,16 +322,17 @@ class RecentWindowQAModel:
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            **({"mm_token_type_ids": inputs["mm_token_type_ids"].to(text_device)}
+               if "mm_token_type_ids" in inputs else {}),
         )
 
     @torch.inference_mode()
     def batch_caption_from_frames(
         self, frames_list: list[list[Image.Image]], question: str
     ) -> list[str]:
-        """Batched captioning for Qwen2.5-VL — builds a left-padded batch
+        """Batched native captioning — builds a left-padded batch
         from the standard processor outputs and runs one model.generate
-        call.  The Qwen3-VL subclass overrides this with its cached-vision
-        path."""
+        call, preserving modality IDs and all visual features."""
         if not frames_list:
             return []
         if len(frames_list) == 1:
@@ -428,6 +429,99 @@ class RecentWindowQAModel:
         ]
 
 
+def _torchcodec_pts_bound(decoder: Any, seconds: float, *, after: bool = False) -> int:
+    # First frame whose real PTS is >= seconds (or > seconds for an end bound).
+    lower, upper = 0, int(decoder.metadata.num_frames)
+    while lower < upper:
+        middle = (lower + upper) // 2
+        timestamp = float(decoder.get_frame_at(middle).pts_seconds)
+        if not math.isfinite(timestamp):
+            raise ValueError("TorchCodec returned a non-finite frame PTS.")
+        if timestamp < seconds or (after and timestamp == seconds):
+            lower = middle + 1
+        else:
+            upper = middle
+    return lower
+
+
+def _read_video_with_pts(video_req: dict[str, Any]) -> tuple[torch.Tensor, list[float], list[float]]:
+    """Qwen's TorchCodec sampling and resize, retaining native frame metadata.
+
+    qwen-vl-utils 0.0.11 drops FrameBatch.pts_seconds and returns only an average
+    sampling rate. It also silently changes backends on failure. Neither behavior
+    is suitable for causal cutoffs, so this path requires TorchCodec explicitly.
+    Unbounded sampling indices and resized pixels match Qwen's native reader.
+    Explicit windows use actual PTS bounds, including for variable frame rates.
+    """
+    try:
+        import qwen_vl_utils.vision_process as vision
+        from torchcodec.decoders import VideoDecoder
+    except ImportError as exc:
+        raise RuntimeError("Causal video decoding requires qwen_vl_utils and torchcodec with native frame PTS.") from exc
+    backend = vision.get_video_reader_backend()
+    if backend != "torchcodec":
+        raise RuntimeError(
+            f"Video backend {backend!r} does not provide verified native PTS in this adapter. "
+            "Install torchcodec and set FORCE_QWENVL_VIDEO_READER=torchcodec."
+        )
+    decoder = VideoDecoder(video_req["video"], num_ffmpeg_threads=int(os.environ.get("TORCHCODEC_NUM_THREADS", 8)))
+    video_fps = float(decoder.metadata.average_fps)
+    total_frames = int(decoder.metadata.num_frames)
+    if not math.isfinite(video_fps) or video_fps <= 0 or total_frames <= 0:
+        raise ValueError("Invalid TorchCodec frame count or average FPS metadata.")
+    if "video_start" in video_req or "video_end" in video_req:
+        start_frame = _torchcodec_pts_bound(decoder, video_req["video_start"]) if "video_start" in video_req else 0
+        end_frame = (_torchcodec_pts_bound(decoder, video_req["video_end"], after=True) - 1
+                     if "video_end" in video_req else total_frames - 1)
+        if start_frame > end_frame:
+            raise ValueError("No video frames fall within the requested PTS window.")
+        total_frames = end_frame - start_frame + 1
+    else:
+        start_frame, end_frame, total_frames = vision.calculate_video_frame_range(video_req, total_frames, video_fps)
+    # Very early queries can have only the first source frame available. Qwen's
+    # video sampler requires an even frame count; our downstream API consumes
+    # individual images and can use that single real frame without future-frame
+    # padding or duplication.
+    nframes = 1 if total_frames == 1 else vision.smart_nframes(video_req, total_frames=total_frames, video_fps=video_fps)
+    indices = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
+    batch = decoder.get_frames_at(indices=indices)
+    video = batch.data
+    if not isinstance(video, torch.Tensor) or video.ndim != 4:
+        raise ValueError("TorchCodec did not return a TCHW video tensor.")
+    try:
+        timestamps = batch.pts_seconds.detach().cpu().reshape(-1).tolist()
+        durations = batch.duration_seconds.detach().cpu().reshape(-1).tolist()
+    except AttributeError as exc:
+        raise RuntimeError("TorchCodec frame PTS/durations are unavailable; synthetic timing is refused.") from exc
+    if len(timestamps) != len(video) or len(durations) != len(video):
+        raise ValueError("TorchCodec frame metadata does not align with decoded frames.")
+    if (not all(math.isfinite(t) and t >= 0 for t in timestamps)
+            or any(b < a for a, b in zip(timestamps, timestamps[1:]))
+            or not all(math.isfinite(d) and d >= 0 for d in durations)):
+        raise ValueError("TorchCodec returned invalid or non-monotone PTS/durations.")
+    if any(t < video_req.get("video_start", 0.0) or t > video_req.get("video_end", math.inf) for t in timestamps):
+        raise ValueError("Decoded frame PTS escaped the requested video window.")
+
+    # Mirror fetch_video's resize exactly; these are the installed package's
+    # constants/helpers, including its VIDEO_MAX_PIXELS/total-pixel budget.
+    _, _, height, width = video.shape
+    min_pixels = video_req.get("min_pixels", vision.VIDEO_MIN_PIXELS)
+    total_pixels = video_req.get("total_pixels", vision.VIDEO_TOTAL_PIXELS)
+    max_pixels = max(min(vision.VIDEO_MAX_PIXELS, total_pixels / nframes * vision.FRAME_FACTOR), int(min_pixels * 1.05))
+    max_pixels = min(video_req.get("max_pixels", max_pixels), max_pixels)
+    if "resized_height" in video_req and "resized_width" in video_req:
+        resized_height, resized_width = vision.smart_resize(
+            video_req["resized_height"], video_req["resized_width"], factor=vision.IMAGE_FACTOR)
+    else:
+        resized_height, resized_width = vision.smart_resize(
+            height, width, factor=vision.IMAGE_FACTOR, min_pixels=min_pixels, max_pixels=max_pixels)
+    video = vision.transforms.functional.resize(
+        video, [resized_height, resized_width], interpolation=vision.InterpolationMode.BICUBIC,
+        antialias=True,
+    ).float()
+    return video, [float(t) for t in timestamps], [float(d) for d in durations]
+
+
 def decode_video_to_chunks_qwen(
     video_path: str,
     chunk_duration: float,
@@ -435,64 +529,32 @@ def decode_video_to_chunks_qwen(
     video_start: float | None = None,
     video_end: float | None = None,
 ) -> tuple[list[EvalChunk], str]:
-    try:
-        from qwen_vl_utils.vision_process import fetch_video
-    except ImportError as exc:
-        raise RuntimeError("qwen_vl_utils is required for video decoding.") from exc
-
-    if chunk_duration <= 0:
+    if not math.isfinite(chunk_duration) or chunk_duration <= 0:
         raise ValueError(f"chunk_duration must be > 0, got {chunk_duration}")
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"fps must be > 0, got {fps}")
 
     video_req: dict[str, Any] = {"video": video_path, "fps": float(fps)}
-    if video_start is not None:
-        video_req["video_start"] = max(0.0, float(video_start))
-    if video_end is not None:
-        video_req["video_end"] = max(0.0, float(video_end))
+    for field, value in (("video_start", video_start), ("video_end", video_end)):
+        if value is not None:
+            if not math.isfinite(value):
+                raise ValueError(f"{field} must be finite, got {value}")
+            video_req[field] = max(0.0, float(value))
+    if "video_end" in video_req and video_req["video_end"] < video_req.get("video_start", 0.0):
+        raise ValueError("video_end must be >= video_start.")
 
-    try:
-        video, sample_fps = fetch_video(video_req, return_video_sample_fps=True)
-        metadata = {"fps": float(sample_fps)}
-    except TypeError:
-        # Older qwen_vl_utils that supports return_video_metadata
-        video, metadata = fetch_video(video_req, return_video_metadata=True)
-
-    if not isinstance(video, torch.Tensor) or video.ndim != 4:
-        raise ValueError(f"Unexpected qwen_vl_utils output for video={video_path!r}")
-
-    meta = metadata if isinstance(metadata, dict) else {}
-    raw_fps = max(float(meta.get("fps", fps if fps > 0 else 1.0)), 1e-6)
-    frame_indices = meta.get("frames_indices")
-    if isinstance(frame_indices, torch.Tensor):
-        frame_indices = frame_indices.detach().cpu().reshape(-1).tolist()
-    elif frame_indices is not None and not isinstance(frame_indices, (list, tuple)):
-        try:
-            frame_indices = list(frame_indices)
-        except TypeError:
-            frame_indices = None
-    if frame_indices is None or len(frame_indices) != int(video.shape[0]):
-        start_frame = int(max(0.0, float(video_start or 0.0)) * raw_fps)
-        frame_indices = [start_frame + i for i in range(int(video.shape[0]))]
-    frame_indices = [int(x) for x in frame_indices]
-
-    if len(frame_indices) > 1:
-        sampled_duration = float(frame_indices[-1] - frame_indices[0]) / raw_fps
-        sampled_fps = float(len(frame_indices) - 1) / max(sampled_duration, 1e-6)
-    else:
-        sampled_fps = max(float(fps), 1e-6)
-    decode_backend = str(meta.get("video_backend", "unknown"))
+    video, timestamps, durations = _read_video_with_pts(video_req)
+    sampled_fps = ((len(timestamps) - 1) / (timestamps[-1] - timestamps[0])
+                   if len(timestamps) > 1 and timestamps[-1] > timestamps[0] else float(fps))
+    decode_backend = "torchcodec_pts"
     if video_start is not None or video_end is not None:
         decode_backend = f"{decode_backend}_window"
-
-    max_ts = max((float(idx) / raw_fps for idx in frame_indices), default=0.0)
-    if len(frame_indices) > 1:
-        frame_dt = max(float(frame_indices[-1] - frame_indices[-2]) / raw_fps, 1.0 / raw_fps)
-    else:
-        frame_dt = 1.0 / raw_fps
-    max_valid_end = max_ts + frame_dt
+    max_valid_end = max((t + d for t, d in zip(timestamps, durations)), default=0.0)
+    if "video_end" in video_req:
+        max_valid_end = min(max_valid_end, video_req["video_end"])
 
     frame_buckets: dict[int, list[tuple[Image.Image, float]]] = {}
-    for i, frame_idx in enumerate(frame_indices):
-        ts = float(frame_idx) / raw_fps
+    for i, ts in enumerate(timestamps):
         chunk_idx = int(ts // chunk_duration)
         frame = video[i].clamp(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
         frame_buckets.setdefault(chunk_idx, []).append((Image.fromarray(frame), ts))
@@ -506,7 +568,8 @@ def decode_video_to_chunks_qwen(
                 frames=[frame for frame, _ in chunk_frames],
                 frame_timestamps=[ts for _, ts in chunk_frames],
                 start_time=chunk_idx * chunk_duration,
-                end_time=min((chunk_idx + 1) * chunk_duration, max_valid_end),
+                end_time=max(max(ts for _, ts in chunk_frames),
+                             min((chunk_idx + 1) * chunk_duration, max_valid_end)),
                 chunk_index=chunk_idx,
                 fps=sampled_fps,
             )

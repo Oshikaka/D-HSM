@@ -1104,11 +1104,11 @@ def _add_rec_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--model_path", required=True)
     sub.add_argument(
         "--anno_path",
-        default="/data/linzhao/vlm/data/ovo_bench/ovo_bench_new.json",
+        default="data/ovo_bench/ovo_bench_new.json",
     )
     sub.add_argument(
         "--chunked_dir",
-        default="/data/linzhao/vlm/data/ovo_bench/chunked_videos",
+        default="data/ovo_bench/chunked_videos",
     )
     sub.add_argument("--result_dir", default="results/hub_and_spoke_rec_ablation")
     sub.add_argument("--chunk_duration", type=float, default=1.0)
@@ -1256,11 +1256,11 @@ def _add_crr_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument("--model_path", required=True)
     sub.add_argument(
         "--anno_path",
-        default="/data/linzhao/vlm/data/ovo_bench/ovo_bench_new.json",
+        default="data/ovo_bench/ovo_bench_new.json",
     )
     sub.add_argument(
         "--chunked_dir",
-        default="/data/linzhao/vlm/data/ovo_bench/chunked_videos",
+        default="data/ovo_bench/chunked_videos",
     )
     sub.add_argument("--result_dir", default="results/hub_and_spoke_crr_interval")
     sub.add_argument("--chunk_duration", type=float, default=1.0)
@@ -1403,8 +1403,8 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 accelerate launch --num_processes 7 \
   experiments/evaluate_ovo_ablations.py rec \
   --model_path Qwen/Qwen2.5-VL-7B-Instruct \
-  --anno_path /data/linzhao/vlm/data/ovo_bench/ovo_bench_new.json \
-  --chunked_dir /data/linzhao/vlm/data/ovo_bench/chunked_videos \
+  --anno_path data/ovo_bench/ovo_bench_new.json \
+  --chunked_dir data/ovo_bench/chunked_videos \
   --result_dir results/hub_and_spoke_rec_ablation_qwen2.5_all \
   --methods storyboard segmented contact_sheet delta event hybrid \
   --storyboard_frames 48 \
@@ -1424,8 +1424,8 @@ accelerate launch --num_processes 7 \
 accelerate launch --num_processes 7 \
   experiments/evaluate_ovo_ablations.py crr \
   --model_path Qwen/Qwen2.5-VL-7B-Instruct \
-  --anno_path /data/linzhao/vlm/data/ovo_bench/ovo_bench_new.json \
-  --chunked_dir /data/linzhao/vlm/data/ovo_bench/chunked_videos \
+  --anno_path data/ovo_bench/ovo_bench_new.json \
+  --chunked_dir data/ovo_bench/chunked_videos \
   --result_dir results/hub_and_spoke_crr_tail \
   --methods tail_mono tail \
   2>&1 | tee results/hub_and_spoke_crr_tail.log

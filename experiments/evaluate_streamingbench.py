@@ -1,23 +1,5 @@
 """
 Hub-and-Spoke StreamingBench Evaluation
-=======================================
-
-StreamingBench evaluator with three readout families:
-
-  - graph_memory
-      Episodic-memory questions, except episodic Counting. Build a
-      Hub-and-Spoke memory from historical chunks and answer with retrieved
-      graph context + recent frames + A/B/C/D logit scoring.
-
-  - recent_window
-      Working-memory/current-frame questions. Answer directly from the latest
-      visual window with A/B/C/D logit scoring.
-
-  - interval_state
-      Episodic Counting questions. Between adjacent question cutoffs for the
-      same count question, predict a count delta and accumulate a state, then
-      map the accumulated count back to the provided A/B/C/D options.
-
 The data layout follows StreamingBench's questions_real.json:
 
   [
@@ -42,8 +24,11 @@ The data layout follows StreamingBench's questions_real.json:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -68,6 +53,7 @@ from dhsm.hub_and_spoke import (
     CAPTION_PROMPT,
     DYNAMIC_TOP_K_MAX,
     DEFAULT_EMBED_MODEL,
+    ENTITY_LINK_THRESHOLD,
     HubAndSpokeEvaluator,
     HubAndSpokeMemory,
     _is_count_question,
@@ -75,19 +61,22 @@ from dhsm.hub_and_spoke import (
 )
 from dhsm.retrieval_gate import (
     DEFAULT_GATE_STRICT_SIM,
-    MEMORY_MODE_CHOICES,
     ROUTING_CHOICES,
     ROUTING_KEYWORD,
-    ROUTING_TASK_LABEL,
     GateDecision,
-    evaluator_class_for,
     gate_question,
-    resolve_memory_mode,
     strip_prompt_scaffolding,
 )
 from dhsm import shard_io
+from dhsm.evaluation_protocol import ensure_result_protocol
 from dhsm.video_qa import decode_video_to_chunks_qwen
 from dhsm.video_qa_qwen3 import RecentWindowQAModel
+from dhsm.memory_selection import (
+    MEMORY_MODE_CHOICES,
+    EntityResolvedMemory,
+    evaluator_class_for,
+    resolve_memory_mode,
+)
 
 
 logging.basicConfig(
@@ -118,9 +107,9 @@ def parse_top_k_arg(raw: str) -> int | str:
     return top_k
 
 
-def format_top_k(top_k: int | str) -> str:
+def format_top_k(top_k: int | str, dynamic_top_k_max: int = DYNAMIC_TOP_K_MAX) -> str:
     if isinstance(top_k, str):
-        return f"{top_k}(max={DYNAMIC_TOP_K_MAX})"
+        return f"{top_k}(max={dynamic_top_k_max})"
     return str(top_k)
 
 
@@ -221,6 +210,13 @@ def fmt_time(seconds: float) -> str:
 
 
 def make_key(video_basename: str, question: dict[str, Any], question_limit: int = 80) -> str:
+    occurrence = question.get("annotation_occurrence_id")
+    if occurrence is not None:
+        if not isinstance(occurrence, str) or re.fullmatch(r"[0-9]+:[0-9]+", occurrence) is None:
+            raise ValueError("Invalid annotation occurrence identity")
+        return f"annotation:{occurrence}"
+    # Retained for older direct API callers; main assigns an occurrence ID to
+    # every question before sorting. Text prefixes are not dataset identity.
     return (
         f"{video_basename}_{question.get('time_stamp', '')}_"
         f"{question.get('task_type', '')}_{question.get('question', '')[:question_limit]}"
@@ -230,6 +226,24 @@ def make_key(video_basename: str, question: dict[str, Any], question_limit: int 
 def _row_key(row: dict[str, Any]) -> str:
     """Reconstruct a checkpoint key from an already-stripped result row."""
     return make_key(row.get("video", ""), row, 80)
+
+
+def annotation_question(
+    question: dict[str, Any], entry_index: int, question_index: int, time_window: str,
+) -> dict[str, Any]:
+    """Preserve the raw question and add position-only identity and audit metadata."""
+    return {**question, "annotation_occurrence_id": f"{entry_index}:{question_index}",
+            "_time_window": time_window}
+
+
+def validate_result_coverage(results: list[dict[str, Any]], expected_keys: set[str]) -> None:
+    """Never publish an aggregate that silently omits an annotation occurrence."""
+    keys = [_row_key(row) for row in results]
+    if len(keys) != len(set(keys)) or len(keys) != len(expected_keys) or set(keys) != expected_keys:
+        raise ValueError(
+            "StreamingBench result coverage mismatch: expected every selected annotation "
+            "occurrence exactly once before scoring."
+        )
 
 
 def normalize_question_key(question: str) -> str:
@@ -299,30 +313,111 @@ def resolve_video_path(video_path: str, video_dir: str) -> str:
     return video_path
 
 
-def route_question_by_task_label(question: dict[str, Any]) -> str:
-    """Original routing: reads the benchmark's own ``required_ability`` and
-    ``task_type`` annotations, i.e. ground-truth metadata.  Kept only so the
-    pre-gate numbers can be reproduced with ``--routing task_label``."""
-    task = str(question.get("task_type", "")).strip()
-    ability = str(question.get("required_ability") or "").strip().lower()
+class SourceMediaUnavailableError(ValueError):
+    """The original source has no verified media at this query timestamp."""
 
-    if task == "Counting" and ability == "episodic memory":
-        return ROUTE_INTERVAL
-    if ability == "episodic memory":
-        return ROUTE_GRAPH
-    if ability == "" and task == "Clips Summarize":
-        return ROUTE_GRAPH
-    return ROUTE_RECENT
+
+def media_file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_media_manifest(
+    manifest_path: str | None, known_video_paths: set[str],
+) -> dict[str, Any] | None:
+    # Validate explicit, data-quality-only input substitutions before models load.
+ 
+    if manifest_path is None:
+        return None
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate media manifest key: {key}")
+            result[key] = value
+        return result
+
+    path = Path(manifest_path).resolve()
+    raw = path.read_bytes()
+    manifest = json.loads(raw, object_pairs_hook=unique_object)
+    if (not isinstance(manifest, dict) or manifest.get("schema_version") != 1
+            or not isinstance(manifest.get("entries"), dict) or not manifest["entries"]):
+        raise ValueError("Media manifest requires schema_version=1 and nonempty entries")
+    entries = manifest["entries"]
+    required = {
+        "original_path", "original_sha256", "input_path", "input_sha256",
+        "verified_until", "unavailable_after", "provenance",
+    }
+    for video_path, entry in entries.items():
+        if video_path not in known_video_paths:
+            raise ValueError(f"Media manifest video is absent from annotations: {video_path}")
+        if not isinstance(entry, dict) or set(entry) != required:
+            raise ValueError(f"Media manifest entry has unexpected/missing fields: {video_path}")
+        if not isinstance(entry["provenance"], dict) or not entry["provenance"]:
+            raise ValueError("Media manifest requires source and validation provenance")
+        proofs = entry["provenance"].get("proofs")
+        if not isinstance(proofs, list) or not proofs:
+            raise ValueError("Media manifest requires SHA-bound validation proof files")
+        for proof in proofs:
+            if (not isinstance(proof, dict) or set(proof) != {"path", "sha256"}
+                    or not isinstance(proof["path"], str)
+                    or not Path(proof["path"]).is_absolute()
+                    or not Path(proof["path"]).is_file()
+                    or not isinstance(proof["sha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", proof["sha256"]) is None):
+                raise ValueError("Media manifest has invalid validation proof binding")
+            if media_file_sha256(proof["path"]) != proof["sha256"]:
+                raise ValueError("Media manifest validation proof SHA256 mismatch")
+        for field in ("verified_until", "unavailable_after"):
+            value = entry[field]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"Media manifest {field} must be finite and nonnegative")
+        if entry["verified_until"] != entry["unavailable_after"]:
+            raise ValueError("Media manifest verified_until must equal unavailable_after")
+        for prefix in ("original", "input"):
+            value, expected = entry[f"{prefix}_path"], entry[f"{prefix}_sha256"]
+            if not isinstance(value, str) or not Path(value).is_absolute() or not Path(value).is_file():
+                raise ValueError(f"Media manifest {prefix}_path must be an existing absolute file")
+            if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+                raise ValueError(f"Media manifest invalid {prefix} SHA256")
+            if media_file_sha256(value) != expected:
+                raise ValueError(f"Media manifest {prefix} SHA256 mismatch: {video_path}")
+        if os.path.samefile(entry["original_path"], entry["input_path"]):
+            raise ValueError("Media manifest must preserve the original file separately")
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
+            "schema_version": 1, "entries": entries}
+
+
+def source_media_for_video(
+    video_path_raw: str, resolved_path: str, media_manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    # Record the actual input hash once per video, retaining original identity.
+    entry = (media_manifest or {}).get("entries", {}).get(video_path_raw)
+    if entry is not None:
+        actual = media_file_sha256(entry["input_path"])
+        if actual != entry["input_sha256"]:
+            raise ValueError(f"Verified prefix changed after media preflight: {video_path_raw}")
+        return {key: entry[key] for key in (
+            "original_path", "original_sha256", "input_path", "input_sha256",
+            "verified_until", "unavailable_after",
+        )} | {"manifest_sha256": media_manifest["sha256"], "status": "verified_prefix"}
+    actual_path = str(Path(resolved_path).resolve())
+    actual_hash = media_file_sha256(actual_path) if Path(actual_path).is_file() else None
+    return {"original_path": actual_path, "original_sha256": actual_hash,
+            "input_path": actual_path, "input_sha256": actual_hash,
+            "verified_until": None, "unavailable_after": None,
+            "manifest_sha256": (media_manifest or {}).get("sha256"),
+            "status": "original" if actual_hash is not None else "missing"}
 
 
 def route_question_by_keyword(question: dict[str, Any]) -> tuple[str, GateDecision]:
-    """Paper-faithful routing: decide from the question text alone.
-
-    Counting questions that also need history keep the interval-state readout,
-    exactly as before — but "is this a counting question" now comes from the
-    same surface-phrase test the memory already uses (``_is_count_question``)
-    rather than from ``task_type``.
-    """
+    # Paper-faithful routing: decide from the question text alone.
+    
     question_text = str(question.get("question", ""))
     decision = gate_question(question_text, question.get("options") or [])
     if not decision.needs_memory:
@@ -333,9 +428,9 @@ def route_question_by_keyword(question: dict[str, Any]) -> tuple[str, GateDecisi
 
 
 def route_question(question: dict[str, Any], routing: str = ROUTING_KEYWORD) -> str:
-    """Route ``question`` under the selected routing mode."""
-    if routing == ROUTING_TASK_LABEL:
-        return route_question_by_task_label(question)
+    # Route from question/option text; reject annotation-based routing.
+    if routing != ROUTING_KEYWORD:
+        raise ValueError("Only question-based keyword routing is supported")
     return route_question_by_keyword(question)[0]
 
 
@@ -485,12 +580,14 @@ def upsert_cached_chunk(
         return
 
     frame_timestamps = list(getattr(chunk, "frame_timestamps", []) or [])
-    if len(frame_timestamps) != len(chunk.frames):
-        span = max(float(chunk.end_time) - float(chunk.start_time), 1e-6)
-        frame_timestamps = [
-            float(chunk.start_time) + span * (i + 0.5) / len(chunk.frames)
-            for i in range(len(chunk.frames))
-        ]
+    if (len(frame_timestamps) != len(chunk.frames)
+            or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in frame_timestamps)
+            or frame_timestamps != sorted(frame_timestamps)):
+        raise ValueError("Cached chunks require matching finite, nonnegative, chronological actual PTS")
+    if (not math.isfinite(chunk.start_time) or not math.isfinite(chunk.end_time)
+            or not 0 <= chunk.start_time <= frame_timestamps[0]
+            or frame_timestamps[-1] > chunk.end_time):
+        raise ValueError("Actual frame PTS fall outside their chunk bounds")
     mid = len(chunk.frames) // 2
     representative_frame = chunk.frames[mid]
     representative_ts = float(frame_timestamps[mid])
@@ -509,6 +606,9 @@ def upsert_cached_chunk(
         chunk_order.append(int(chunk.chunk_index))
         return
 
+    if (len(existing.frames) != len(existing.frame_timestamps)
+            or (existing.frame_timestamps and frame_timestamps[0] < existing.frame_timestamps[-1])):
+        raise ValueError("Appending a chunk would lose actual PTS alignment or chronological order")
     existing.start_time = min(existing.start_time, float(chunk.start_time))
     existing.end_time = max(existing.end_time, float(chunk.end_time))
     existing.frames.extend(chunk.frames)
@@ -516,10 +616,7 @@ def upsert_cached_chunk(
     if existing.frames:
         mid = len(existing.frames) // 2
         existing.representative_frame = existing.frames[mid]
-        if existing.frame_timestamps and mid < len(existing.frame_timestamps):
-            existing.representative_ts = float(existing.frame_timestamps[mid])
-        else:
-            existing.representative_ts = (existing.start_time + existing.end_time) / 2.0
+        existing.representative_ts = float(existing.frame_timestamps[mid])
 
 
 def drop_old_recent_frames(
@@ -588,34 +685,60 @@ def build_memory_from_cached_chunks(
 ) -> HubAndSpokeMemory:
     ensure_captions(selected_chunks, qa_model, caption_batch_size)
     if evaluator is not None:
-        # Respects the evaluator's memory type (flat_caption ablation) and
-        # expand_retrieval flag.
+        # Respect the selected memory, including explicit legacy ablations.
         memory = evaluator._make_memory()
     else:
-        memory = HubAndSpokeMemory(
+        memory = EntityResolvedMemory(
             embed_model=embed_model,
             embed_device=embed_device,
             sim_threshold=sim_threshold,
         )
     for chunk in selected_chunks:
         if chunk.caption:
-            memory.update(chunk.caption, chunk.representative_ts)
+            if isinstance(memory, EntityResolvedMemory):
+                # Caption IDs are local to this actual cached chunk. Keep its
+                # provenance independent of rounded representative timestamps.
+                memory.update(chunk.caption, chunk.representative_ts, chunk_id=chunk.chunk_index)
+            else:
+                memory.update(chunk.caption, chunk.representative_ts)
     return memory
 
 
-def recent_frames_for_answer(
+def recent_frame_items_for_answer(
     chunk_cache: dict[int, CachedChunk],
     chunk_order: list[int],
     window: int,
-) -> list[Any]:
-    frames: list[Any] = []
+    current_cutoff: float | None = None,
+) -> list[tuple[float, Any]]:
+    """Last N distinct actual frames inside the unchanged recent-chunk region."""
+    if current_cutoff is not None and (not math.isfinite(current_cutoff) or current_cutoff < 0):
+        raise ValueError("A finite nonnegative question cutoff is required")
+    items: list[tuple[float, Any]] = []
     for chunk_id in chunk_order[-max(1, window):]:
         chunk = chunk_cache[chunk_id]
         if chunk.frames:
-            frames.extend(chunk.frames)
+            if len(chunk.frames) != len(chunk.frame_timestamps):
+                raise ValueError("Recent frames lack matching actual PTS")
+            items.extend(zip(chunk.frame_timestamps, chunk.frames))
         elif chunk.representative_frame is not None:
-            frames.append(chunk.representative_frame)
-    return frames
+            items.append((chunk.representative_ts, chunk.representative_frame))
+    times = [t for t, _ in items]
+    if (any(type(t) not in (int, float) or not math.isfinite(t) or t < 0
+            or (current_cutoff is not None and t > current_cutoff) for t in times)
+            or times != sorted(times)):
+        raise ValueError("Recent actual PTS are invalid, nonchronological or after the question")
+    distinct = {}
+    for timestamp, frame in items:
+        distinct.setdefault(timestamp, frame)
+    return list(distinct.items())[-max(1, int(window)):]
+
+
+def recent_frames_for_answer(
+    chunk_cache: dict[int, CachedChunk], chunk_order: list[int], window: int,
+    current_cutoff: float | None = None,
+) -> list[Any]:
+    return [frame for _, frame in recent_frame_items_for_answer(
+        chunk_cache, chunk_order, window, current_cutoff)]
 
 
 def cached_frame_items_between(
@@ -695,8 +818,13 @@ def answer_graph_memory(
     max_extraction_chunks: int,
     caption_batch_size: int,
     min_evidence_sim: float | None = None,
+    current_cutoff: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     window = max(1, int(recent_frames_only))
+    recent = recent_frame_items_for_answer(chunk_cache, chunk_order, window, current_cutoff)
+    recent_times, recent_frames = [t for t, _ in recent], [f for _, f in recent]
+    if not recent_frames:
+        raise ValueError("No recent frames available for graph_memory answer")
     hist_chunk_ids = chunk_order[:-window] if len(chunk_order) > window else []
     selected_ids = select_history_chunk_ids(
         hist_chunk_ids,
@@ -704,6 +832,9 @@ def answer_graph_memory(
         max_extraction_chunks=max_extraction_chunks,
     )
     selected_chunks = [chunk_cache[idx] for idx in selected_ids]
+    if any(not math.isfinite(c.representative_ts) or c.representative_ts >= recent_times[0]
+           for c in selected_chunks):
+        raise ValueError("Historical caption frames must precede the recent visual window")
     memory = build_memory_from_cached_chunks(
         selected_chunks,
         qa,
@@ -713,10 +844,6 @@ def answer_graph_memory(
         caption_batch_size=caption_batch_size,
         evaluator=evaluator,
     )
-    recent_frames = recent_frames_for_answer(chunk_cache, chunk_order, window)
-    if not recent_frames:
-        raise ValueError("No recent frames available for graph_memory answer")
-
     evaluator.last_retrieval = None
     response = evaluator.answer_with_memory_mcq(
         memory,
@@ -730,6 +857,10 @@ def answer_graph_memory(
         "hist_chunk_candidates": len(hist_chunk_ids),
         "hist_chunk_selected": len(selected_chunks),
         "num_recent_frames": len(recent_frames),
+        "recent_frame_timestamps": recent_times,
+        "query_cutoff": current_cutoff,
+        "history_chunk_ids": selected_ids,
+        "history_frame_timestamps": [c.representative_ts for c in selected_chunks],
         "route_min_evidence_sim": min_evidence_sim,
         "retrieval_matched_nodes": (
             retrieval.matched_nodes if retrieval is not None else None
@@ -751,17 +882,22 @@ def answer_recent_window(
     chunk_order: list[int],
     qa: RecentWindowQAModel,
     recent_frames_only: int,
+    current_cutoff: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    recent_frames = recent_frames_for_answer(
+    recent = recent_frame_items_for_answer(
         chunk_cache,
         chunk_order,
         max(1, int(recent_frames_only)),
+        current_cutoff,
     )
+    recent_times, recent_frames = [t for t, _ in recent], [f for _, f in recent]
     if not recent_frames:
         raise ValueError("No recent frames available for recent_window answer")
     response = qa.score_mcq_from_frames(recent_frames, build_prompt(question), num_options=4)
     return response, {
         "num_recent_frames": len(recent_frames),
+        "recent_frame_timestamps": recent_times,
+        "query_cutoff": current_cutoff,
         "readout": "recent_window_abcd_logits",
     }
 
@@ -775,12 +911,7 @@ def answer_baseline_hist_recent(
     hist_frames: int,
     sampling: str = "hist_plus_recent",
 ) -> tuple[str, dict[str, Any]]:
-    """Bare-backbone matched baselines (no memory).
-
-    hist_plus_recent: the same recent window plus the same ΠB-selected
-    historical chunks D-HSM would caption, as raw visual frames.
-    uniform: hist_frames + recent_frames_only frames sampled uniformly over
-    the whole available prefix (matched total budget, no recency guarantee)."""
+    # Bare-backbone matched baselines (no memory).
     window = max(1, int(recent_frames_only))
     if sampling == "uniform":
         selected_ids = select_history_chunk_ids(
@@ -973,6 +1104,7 @@ def _base_result_row(
     route: str,
     time_window: str,
     time_seconds: float | None = None,
+    source_media: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fields shared by every result row: success, error, and the
     missing-video placeholder."""
@@ -988,8 +1120,12 @@ def _base_result_row(
     }
     if time_seconds is not None:
         row["time_seconds"] = time_seconds
+    if "annotation_occurrence_id" in question:
+        row["annotation_occurrence_id"] = question["annotation_occurrence_id"]
     row["question"] = question.get("question", "")
     row["options"] = question.get("options", [])
+    if source_media is not None:
+        row["source_media"] = dict(source_media)
     return row
 
 
@@ -1015,7 +1151,10 @@ def run_rank(
     baseline_sampling: str | None = None,
     routing: str = ROUTING_KEYWORD,
     gate_strict_sim: float = DEFAULT_GATE_STRICT_SIM,
+    media_manifest: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    if routing != ROUTING_KEYWORD:
+        raise ValueError("Only question-based keyword routing is supported")
     import torch
 
     all_results, done_keys = shard_io.resume(ckpt_path, key_fn=_row_key)
@@ -1035,6 +1174,8 @@ def run_rank(
             questions = video_questions[video_path_raw]
             video_path = resolve_video_path(video_path_raw, video_dir)
             video_basename = os.path.basename(video_path)
+            source_media = source_media_for_video(video_path_raw, video_path, media_manifest)
+            video_path = source_media["input_path"]
             logger.info(
                 "[rank%d video %d/%d] %s (%d qs)",
                 rank,
@@ -1058,7 +1199,8 @@ def run_rank(
                             video_categories,
                             question,
                             route,
-                            time_window=video_windows.get(video_path_raw, [""])[0],
+                            time_window=question.get("_time_window", video_windows.get(video_path_raw, [""])[0]),
+                            source_media=source_media | {"input_used_for_question": False},
                         ),
                         "answer_gt": answer_gt_letter(question),
                         "response": None,
@@ -1074,7 +1216,7 @@ def run_rank(
             chunk_cache: dict[int, CachedChunk] = {}
             chunk_order: list[int] = []
             count_states: dict[str, CountState] = {}
-            last_decode_end = 0.0
+            last_decode_end: float | None = None
             decode_backend = "cached_window"
 
             for question in questions:
@@ -1093,8 +1235,6 @@ def run_rank(
                 gate_decision: GateDecision | None = None
                 if baseline_sampling:
                     route = f"baseline_{baseline_sampling}"
-                elif routing == ROUTING_TASK_LABEL:
-                    route = route_question_by_task_label(question)
                 else:
                     route, gate_decision = route_question_by_keyword(question)
                 # History is injected under the stricter floor only when the
@@ -1105,22 +1245,35 @@ def run_rank(
                     else None
                 )
                 ts_sec = float(timestamp_to_seconds(question.get("time_stamp", 0.0)))
+                row_media = source_media | {"input_used_for_question": False}
 
                 try:
                     t0 = time.perf_counter()
 
-                    target_decode_end = max(0.0, ts_sec) + 1e-4
-                    if target_decode_end > last_decode_end + 1e-6:
+                    if not math.isfinite(ts_sec) or ts_sec < 0:
+                        raise ValueError("A finite nonnegative question timestamp is required")
+                    limit = source_media["verified_until"]
+                    if limit is not None and ts_sec > limit:
+                        row_media["status"] = "unavailable"
+                        raise SourceMediaUnavailableError(
+                            f"Source media unavailable at {ts_sec:g}s; verified only through {limit:g}s"
+                        )
+                    row_media["input_used_for_question"] = True
+                    target_decode_end = ts_sec
+                    if last_decode_end is None or target_decode_end > last_decode_end:
+                        decode_start = 0.0 if last_decode_end is None else math.nextafter(last_decode_end, math.inf)
                         chunks, decode_backend = decode_video_to_chunks_qwen(
                             video_path=video_path,
                             chunk_duration=chunk_duration,
                             fps=fps,
-                            video_start=last_decode_end,
+                            video_start=decode_start,
                             video_end=target_decode_end,
                         )
                         if not chunks and not chunk_order:
                             raise ValueError("No chunks decoded")
                         for chunk in chunks:
+                            if any(t < decode_start or t > ts_sec for t in chunk.frame_timestamps):
+                                raise ValueError("Decoded actual PTS escaped the causal query window")
                             upsert_cached_chunk(chunk_cache, chunk_order, chunk)
                         last_decode_end = target_decode_end
 
@@ -1146,6 +1299,7 @@ def run_rank(
                             max_extraction_chunks=max_extraction_chunks,
                             caption_batch_size=caption_batch_size,
                             min_evidence_sim=min_evidence_sim,
+                            current_cutoff=ts_sec,
                         )
                     elif route == ROUTE_INTERVAL:
                         count_key = normalize_question_key(question.get("question", ""))
@@ -1168,6 +1322,7 @@ def run_rank(
                             chunk_order,
                             qa,
                             recent_frames_only=recent_frames_only,
+                            current_cutoff=ts_sec,
                         )
 
                     generate_time = time.perf_counter() - t0
@@ -1183,6 +1338,7 @@ def run_rank(
                             route,
                             time_window=question.get("_time_window", ""),
                             time_seconds=ts_sec,
+                            source_media=row_media,
                         ),
                         "answer_gt": gt,
                         "response": response,
@@ -1190,9 +1346,6 @@ def run_rank(
                         "decode_backend": decode_backend,
                         "generate_time": generate_time,
                         "routing_mode": routing,
-                        # Agreement audit: what the old annotation-driven rule
-                        # would have chosen for this question.
-                        "route_task_label": route_question_by_task_label(question),
                         **(gate_decision.as_metadata() if gate_decision else {}),
                         **metadata,
                     }
@@ -1218,11 +1371,14 @@ def run_rank(
                             route,
                             time_window=question.get("_time_window", ""),
                             time_seconds=ts_sec,
+                            source_media=row_media,
                         ),
                         "answer_gt": answer_gt_letter(question),
                         "response": None,
                         "correct": False,
                         "error": str(exc),
+                        **({"error_code": "source_media_unavailable"}
+                           if isinstance(exc, SourceMediaUnavailableError) else {}),
                     }
                     logger.exception(
                         "  [rank%d %d/%d] %s %s/%s failed for %s: %s",
@@ -1253,12 +1409,61 @@ def run_rank(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def build_result_protocol(
+    args: argparse.Namespace, annotation_bytes: bytes, num_processes: int,
+) -> dict[str, Any]:
+    # Keep old ID handling, data and inference settings out of a new run.
+    media_manifest = load_media_manifest(
+        getattr(args, "media_manifest", None),
+        {entry["video_path"] for entry in json.loads(annotation_bytes)},
+    )
+    runtime_versions = {}
+    for package in (
+        "torch", "torchvision", "transformers", "accelerate", "qwen-vl-utils",
+        "numpy", "pillow", "av", "decord", "torchcodec", "sentence-transformers",
+    ):
+        try:
+            runtime_versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            runtime_versions[package] = None
+    source_files = sorted((PROJECT_ROOT / "dhsm").glob("*.py")) + [Path(__file__).resolve()]
+    return {
+        "benchmark": "streamingbench",
+        "config": dict(vars(args)),
+        "annotation_sha256": hashlib.sha256(annotation_bytes).hexdigest(),
+        "media_manifest": media_manifest,
+        "num_processes": num_processes,
+        "entity_link_threshold": ENTITY_LINK_THRESHOLD,
+        "embed_device": "cpu",
+        "processor_overrides": {
+            key: int(os.environ[key]) if os.environ.get(key) else None
+            for key in ("MIN_PIXELS", "MAX_PIXELS")
+        },
+        "video_environment": {
+            key: os.environ.get(key) for key in (
+                "VIDEO_MAX_PIXELS", "FORCE_QWENVL_VIDEO_READER", "TORCHCODEC_NUM_THREADS",
+            )
+        },
+        "runtime_versions": runtime_versions,
+        "code_sha256": {
+            str(path.relative_to(PROJECT_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in source_files
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Hub-and-Spoke StreamingBench evaluation"
     )
     parser.add_argument("--anno_path", "--anno-path", required=True)
     parser.add_argument("--video_dir", "--video-dir", required=True)
+    parser.add_argument(
+        "--media_manifest", "--media-manifest", default=None,
+        help=("Optional SHA-bound data-quality manifest for verified video prefixes. "
+              "Questions beyond a prefix's verified_until become explicit media errors "
+              "and remain in the scoring denominator."),
+    )
     parser.add_argument("--result_dir", "--output-dir", default=None)
     parser.add_argument(
         "--model_path",
@@ -1279,8 +1484,8 @@ def main() -> None:
         "--max_extraction_chunks",
         "--max-extraction-chunks",
         type=int,
-        default=30,
-        help="Cap on historical chunks for graph_memory; 0=unlimited.",
+        default=20,
+        help="Cap on historical chunks for graph_memory (default: 20); 0=unlimited.",
     )
     parser.add_argument("--sim_threshold", "--sim-threshold", type=float, default=0.25)
     parser.add_argument(
@@ -1288,10 +1493,7 @@ def main() -> None:
         choices=ROUTING_CHOICES,
         default=ROUTING_KEYWORD,
         help=(
-            "How the memory/recent-window decision is made. 'keyword' (default) "
-            "gates on question text only, as described in the paper. 'task_label' "
-            "reads the benchmark's required_ability/task_type annotations and is "
-            "kept only to reproduce the pre-gate numbers."
+            "Choose memory or recent frames from question/option text only."
         ),
     )
     parser.add_argument(
@@ -1301,7 +1503,7 @@ def main() -> None:
         help=(
             "Similarity floor applied when the keyword gate cannot tell whether "
             "history is needed (the 'ambiguous' bucket). History is injected only "
-            "if some memory entry clears it. Ignored when --routing task_label."
+            "if some memory entry clears it."
         ),
     )
     parser.add_argument(
@@ -1311,10 +1513,15 @@ def main() -> None:
         default="dynamic",
         help=(
             "Fixed retrieval budget (int), or dynamic/auto/adaptive for "
-            f"elbow-cutoff mode capped at {DYNAMIC_TOP_K_MAX}. Defaults to "
+            "elbow-cutoff mode capped by --dynamic_top_k_max. Defaults to "
             "dynamic: a fixed budget is the Table 6 / Fig. 1 'static HSM "
             "retrieval' baseline, not D-HSM."
         ),
+    )
+    parser.add_argument(
+        "--dynamic_top_k_max", type=int, default=12,
+        help="Maximum candidate pool for dynamic retrieval (default: 12). "
+             "The original elbow rule can select fewer seeds; integer --top_k is unchanged.",
     )
     parser.add_argument(
         "--embed_model",
@@ -1326,8 +1533,8 @@ def main() -> None:
         "--caption_batch_size",
         "--caption-batch-size",
         type=int,
-        default=0,
-        help="Batch size for graph_memory history captions; 0/1 disables batching.",
+        default=4,
+        help="Batch size for graph_memory history captions (default: 4); 0/1 disables batching.",
     )
     parser.add_argument("--count_interval_frames", type=int, default=16)
     parser.add_argument("--count_interval_context_seconds", type=float, default=1.0)
@@ -1335,7 +1542,7 @@ def main() -> None:
     parser.add_argument(
         "--attn_implementation",
         default="flash_attention_2",
-        help="Attention backend for the VLM (e.g. flash_attention_2, sdpa).",
+        help="Attention backend for the VLM (default: flash_attention_2; pass sdpa to skip flash-attn).",
     )
     parser.add_argument(
         "--no_expansion",
@@ -1347,6 +1554,8 @@ def main() -> None:
         choices=list(MEMORY_MODE_CHOICES),
         default=None,
         help=(
+            "entity_resolved (default): incremental memory with chunk-local "
+            "caption IDs linked across chunks by entity descriptions. "
             "hub_spoke: dhsm/hub_and_spoke.py, the non-provenance variant. "
             "flat_caption: ablation storing each chunk's whole caption as one "
             "retrieval unit (same captions and retrieval hyperparameters, no "
@@ -1355,8 +1564,8 @@ def main() -> None:
             "tracking variant implementing Algorithm 2. As on OVO, the "
             "streaming path here only calls update(), so this does not "
             "exercise its remove_chunks() removal path. "
-            "Defaults to incremental for both routing modes, so an A/B over "
-            "--routing isolates the gate; pass it explicitly to override."
+            "Defaults to entity_resolved with chunk-local ID repair; "
+            "select an alternative explicitly for an ablation."
         ),
     )
     parser.add_argument(
@@ -1388,28 +1597,28 @@ def main() -> None:
     parser.add_argument("--max_videos", type=int, default=None)
     parser.add_argument("--max_questions_per_video", type=int, default=None)
     args = parser.parse_args()
-    # --routing keyword implies the incremental (Algorithm 2) memory unless
-    # --memory_mode was given explicitly.
+    if args.dynamic_top_k_max < 1:
+        parser.error("--dynamic_top_k_max must be positive.")
+    # Use the repaired shared memory unless an ablation is requested.
     args.memory_mode = resolve_memory_mode(args.routing, args.memory_mode)
 
     accelerator = Accelerator(
         kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=24))]
     )
 
-    with open(args.anno_path) as f:
-        all_data = json.load(f)
+    annotation_bytes = Path(args.anno_path).read_bytes()
+    all_data = json.loads(annotation_bytes)
 
     video_questions: dict[str, list[dict[str, Any]]] = defaultdict(list)
     video_categories: dict[str, str] = {}
     video_windows: dict[str, list[str]] = defaultdict(list)
-    for entry in all_data:
+    for entry_index, entry in enumerate(all_data):
         vp = entry["video_path"]
         video_categories[vp] = entry.get("video_categories", "")
         time_window = entry.get("time", "")
         video_windows[vp].append(time_window)
-        for question in entry.get("questions", []):
-            item = dict(question)
-            item["_time_window"] = time_window
+        for question_index, question in enumerate(entry.get("questions", [])):
+            item = annotation_question(question, entry_index, question_index, time_window)
             video_questions[vp].append(item)
 
     for vp in video_questions:
@@ -1424,6 +1633,12 @@ def main() -> None:
         all_video_paths = all_video_paths[: args.max_videos]
 
     total_questions = sum(len(video_questions[vp]) for vp in all_video_paths)
+    expected_keys = {
+        make_key(os.path.basename(vp), question)
+        for vp in all_video_paths for question in video_questions[vp]
+    }
+    if len(expected_keys) != total_questions:
+        raise ValueError("Selected StreamingBench annotation occurrence identities are not unique")
     route_counts: dict[str, int] = defaultdict(int)
     task_route_counts: dict[tuple[str, str], int] = defaultdict(int)
     for vp in all_video_paths:
@@ -1438,11 +1653,19 @@ def main() -> None:
         model_tag = Path(str(args.model_path).rstrip("/")).name.lower().replace("-instruct", "")
         run_tag = (
             f"hub_and_spoke_{model_tag}"
+            f"_{args.memory_mode}"
             f"_recent{args.recent_frames_only}"
             f"_extract{args.extract_every_n_chunks}"
             f"_streamingbench"
         )
         output_dir = os.path.join("results", "streamingbench", run_tag)
+
+    result_protocol = build_result_protocol(args, annotation_bytes, accelerator.num_processes)
+    ensure_result_protocol(output_dir, result_protocol)
+    
+    if accelerator.is_main_process:
+        shard_io.clear_done_markers(output_dir, accelerator.num_processes)
+    accelerator.wait_for_everyone()
 
     accelerator.print(f"\n{'=' * 60}")
     accelerator.print("Hub-and-Spoke StreamingBench Evaluation")
@@ -1458,7 +1681,7 @@ def main() -> None:
     accelerator.print(
         f"recent_frames={args.recent_frames_only}  "
         f"embed_model={args.embed_model}  sim_threshold={args.sim_threshold}  "
-        f"top_k={format_top_k(args.top_k)}  "
+        f"top_k={format_top_k(args.top_k, args.dynamic_top_k_max)}  "
         f"routing={args.routing}  "
         f"memory_mode={args.memory_mode}  "
         f"gate_strict_sim={args.gate_strict_sim}  "
@@ -1484,6 +1707,7 @@ def main() -> None:
         embed_model=args.embed_model,
         sim_threshold=args.sim_threshold,
         top_k=args.top_k,
+        dynamic_top_k_max=args.dynamic_top_k_max,
         caption_batch_size=args.caption_batch_size,
         expand_retrieval=not args.no_expansion,
         expand_co_occurrence=not args.no_cooccurrence,
@@ -1504,9 +1728,6 @@ def main() -> None:
         accelerator.process_index,
         accelerator.num_processes,
     )
-    if os.path.exists(done_marker_path):
-        os.remove(done_marker_path)
-
     logger.info(
         "[rank%d] assigned %d videos",
         accelerator.process_index,
@@ -1535,6 +1756,7 @@ def main() -> None:
         baseline_sampling=args.baseline_sampling,
         routing=args.routing,
         gate_strict_sim=args.gate_strict_sim,
+        media_manifest=result_protocol["media_manifest"],
     )
 
     shard_io.write_done_marker(done_marker_path)
@@ -1542,6 +1764,7 @@ def main() -> None:
     if accelerator.is_main_process:
         shard_io.wait_for_done_markers(output_dir, accelerator.num_processes)
         all_results = shard_io.merge_shards(output_dir, accelerator.num_processes, key_fn=_row_key)
+        validate_result_coverage(all_results, expected_keys)
 
         model_label = f"HubAndSpoke-{Path(args.model_path.rstrip('/')).name}"
         print_summary(all_results, label=model_label)
@@ -1553,6 +1776,7 @@ def main() -> None:
             os.path.join(output_dir, f"hub_and_spoke_streamingbench_{ts}.json"),
             {
                 "config": vars(args),
+                "media_manifest": result_protocol["media_manifest"],
                 "route_counts": dict(route_counts),
                 "task_route_counts": {
                     f"{task}/{route}": count

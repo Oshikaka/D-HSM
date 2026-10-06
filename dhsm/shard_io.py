@@ -1,13 +1,4 @@
-"""Resumable JSONL checkpointing shared by the benchmark evaluators.
-
-Each rank appends every finished row to its own shard file, tagged with a
-``_key`` that identifies the row, so a restart skips what is already there.
-When a rank is done it drops a ``done`` marker; rank 0 waits for every marker
-and then merges the shards, de-duplicating on ``_key``.
-
-Single-process runs write straight into ``result_dir`` with no ``rank_*``
-subdirectory.
-"""
+"""Resumable JSONL checkpointing shared by the benchmark evaluators."""
 
 from __future__ import annotations
 
@@ -35,8 +26,12 @@ def done_path(result_dir: str, rank: int, n_procs: int) -> str:
     return str(shard_dir(result_dir, rank, n_procs) / "done")
 
 
+def clear_done_markers(result_dir: str, n_procs: int) -> None:
+    for rank in range(n_procs):
+        Path(done_path(result_dir, rank, n_procs)).unlink(missing_ok=True)
+
+
 def read_rows(path: str) -> list[dict[str, Any]]:
-    """Every row of a shard file, ``_key`` included. Missing file -> []."""
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as handle:
@@ -53,7 +48,6 @@ def append_row(handle: Any, row: dict[str, Any], key: str) -> None:
 
 
 def resume(path: str, key_fn: Callable[[dict[str, Any]], str]) -> tuple[list[dict[str, Any]], set[str]]:
-    """Rows already checkpointed by this rank, and the keys to skip."""
     rows, keys = [], set()
     for raw in read_rows(path):
         row = strip_key(raw)
@@ -67,7 +61,6 @@ def merge_shards(
     n_procs: int,
     key_fn: Callable[[dict[str, Any]], str] | None = None,
 ) -> list[dict[str, Any]]:
-    """All ranks' rows in shard order, first occurrence of each key wins."""
     paths = [
         checkpoint_path(result_dir, rank, n_procs)
         for rank in (range(n_procs) if n_procs > 1 else [0])
@@ -91,7 +84,6 @@ def write_done_marker(path: str) -> None:
 
 
 def wait_for_done_markers(result_dir: str, n_procs: int) -> None:
-    """Block until every rank's marker lands on the (possibly networked) fs."""
     if n_procs <= 1:
         return
     timeout = float(os.environ.get("FILE_SYNC_TIMEOUT_SECONDS", "43200"))
@@ -108,7 +100,6 @@ def wait_for_done_markers(result_dir: str, n_procs: int) -> None:
 
 
 def flatten_gathered(gathered: list[Any]) -> list[dict[str, Any]]:
-    """Flatten accelerate's gather_object output (list of per-rank lists)."""
     flat: list[dict[str, Any]] = []
     for item in gathered:
         flat.extend(item) if isinstance(item, list) else flat.append(item)
@@ -122,7 +113,6 @@ def save_json(path: str, payload: Any) -> None:
 
 
 def _self_check() -> None:
-    """python dhsm/shard_io.py -- round-trips a two-rank run through tmp files."""
     import tempfile
 
     key_of = lambda row: f"{row['task']}:{row['id']}"

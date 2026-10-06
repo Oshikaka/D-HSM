@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
-# Evaluate D-HSM on OVO-Bench and/or StreamingBench.
-#
-#   BENCH=ovo  DATA_ROOT=/path/to/data  scripts/run_eval.sh
-#   BENCH=sb   DATA_ROOT=/path/to/data  scripts/run_eval.sh
-#   BENCH=both DATA_ROOT=/path/to/data  scripts/run_eval.sh     # default
-#
 set -euo pipefail
 
-# --- edit these for your machine -------------------------------------------
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-VL-7B-Instruct}"
 EMBED_MODEL="${EMBED_MODEL:-BAAI/bge-small-en-v1.5}"
 DATA_ROOT="${DATA_ROOT:?set DATA_ROOT to the directory holding ovo_bench/ and streamingbench/}"
@@ -15,43 +8,43 @@ OVO_ANNO="${OVO_ANNO:-$DATA_ROOT/ovo_bench/ovo_bench_new.json}"
 OVO_VIDEOS="${OVO_VIDEOS:-$DATA_ROOT/ovo_bench/chunked_videos}"
 SB_ANNO="${SB_ANNO:-$DATA_ROOT/streamingbench/questions_real.json}"
 SB_VIDEOS="${SB_VIDEOS:-$DATA_ROOT/streamingbench/videos}"
-BENCH="${BENCH:-both}"          # ovo | sb | both
-NPROC="${NPROC:-2}"             # GPUs
+BENCH="${BENCH:-both}"
+NPROC="${NPROC:-2}"
+RECENT_FRAMES="${RECENT_FRAMES:-4}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+OVO_MCQ_PROMPT_POLICY="${OVO_MCQ_PROMPT_POLICY:-uniform_abstention}"
+OVO_HISTORY_MODE="${OVO_HISTORY_MODE:-dhsm}"
+SB_GATE_STRICT_SIM="${SB_GATE_STRICT_SIM:-0.55}"
+SB_DYNAMIC_TOP_K_MAX="${SB_DYNAMIC_TOP_K_MAX:-12}"
+OUT="${OUT:-results/keyword_${OVO_MCQ_PROMPT_POLICY}_${OVO_HISTORY_MODE}_${RECENT_FRAMES}f}"
 
-# Routing: how D-HSM decides whether a question needs memory at all.
-#
-#   task_label — read the benchmark's own annotation (OVO task EPM/ASI/HLD vs
-#                the Real-Time tasks; StreamingBench required_ability).  This
-#                is the setting the reported table numbers were produced with,
-#                so it is what this script uses.  It consumes ground-truth
-#                metadata at inference time and therefore does not generalise
-#                to an arbitrary streaming question.
-#
-#   keyword    — the paper's §3.3 gate: decide from the question text alone
-#                (dhsm/retrieval_gate.py).  This is the default in the code
-#                (`--routing` defaults to keyword) and the only mode that runs
-#                on questions with no benchmark annotation.
-#
-# To switch: set ROUTING=keyword (or just drop --routing, since keyword is the
-# code default).  Running both and diffing gives the cost of the gate:
-#
-#   ROUTING=task_label OUT=results/task_label scripts/run_eval.sh
-#   ROUTING=keyword    OUT=results/keyword    scripts/run_eval.sh
-#   python experiments/compare_gate_ab.py \
-#       --ovo_baseline results/task_label/ovo --ovo_gated results/keyword/ovo \
-#       --sb_baseline  results/task_label/sb  --sb_gated  results/keyword/sb
-#
-ROUTING="${ROUTING:-task_label}"
-GATE_STRICT_SIM="${GATE_STRICT_SIM:-0.55}"   # ambiguous-bucket floor; keyword only
-OUT="${OUT:-results/$ROUTING}"
-# ---------------------------------------------------------------------------
+case "$BENCH" in
+  ovo|sb|both) ;;
+  *) echo "BENCH must be ovo, sb, or both" >&2; exit 2 ;;
+esac
+if [[ "${ROUTING:-keyword}" != keyword ]]; then
+  echo "Only keyword routing is supported; task-label routing has been removed." >&2
+  exit 2
+fi
+if [[ "$OVO_HISTORY_MODE" == recent_only ]]; then
+  OVO_SPLITS="${OVO_SPLITS:-backward,realtime}"
+else
+  OVO_SPLITS="${OVO_SPLITS:-backward,realtime,forward}"
+fi
 
-# Paper defaults (§4.1): 20 historical chunks, 4 recent frames, dynamic cutoff
-# capped at K=12, bge-small-en-v1.5 embeddings.
+export FORCE_QWENVL_VIDEO_READER=torchcodec
+export TORCHCODEC_NUM_THREADS="${TORCHCODEC_NUM_THREADS:-2}"
+export MIN_PIXELS="${MIN_PIXELS:-50176}"
+export MAX_PIXELS="${MAX_PIXELS:-262144}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+
 COMMON=(
   --model_path "$MODEL_PATH"
   --embed_model "$EMBED_MODEL"
-  --recent_frames_only 4
+  --attn_implementation "$ATTN_IMPLEMENTATION"
+  --recent_frames_only "$RECENT_FRAMES"
   --chunk_duration 1.0
   --fps 1.0
   --max_qa_tokens 256
@@ -60,36 +53,40 @@ COMMON=(
   --sim_threshold 0.25
   --top_k dynamic
   --caption_batch_size 4
-  --routing "$ROUTING"
-  --gate_strict_sim "$GATE_STRICT_SIM"
+  --routing keyword
+  --memory_mode entity_resolved
 )
-
+OVO_OPTIONS=()
+if [[ -n "${OVO_MEMORY_FLOOR:-}" ]]; then
+  OVO_OPTIONS+=(--memory_floor "$OVO_MEMORY_FLOOR")
+fi
+if [[ -n "${OVO_GATE_STRICT_SIM:-}" ]]; then
+  OVO_OPTIONS+=(--gate_strict_sim "$OVO_GATE_STRICT_SIM")
+fi
+if [[ -n "${OVO_DYNAMIC_TOP_K_MAX:-}" ]]; then
+  OVO_OPTIONS+=(--dynamic_top_k_max "$OVO_DYNAMIC_TOP_K_MAX")
+fi
 mkdir -p "$OUT"
 
-if [[ "$BENCH" == "ovo" || "$BENCH" == "both" ]]; then
-  echo "=== OVO-Bench  routing=$ROUTING ==="
+if [[ "$BENCH" == ovo || "$BENCH" == both ]]; then
   accelerate launch --num_processes "$NPROC" \
-    experiments/evaluate_ovo.py \
-    "${COMMON[@]}" \
-    --anno_path "$OVO_ANNO" \
-    --chunked_dir "$OVO_VIDEOS" \
+    experiments/evaluate_ovo.py "${COMMON[@]}" \
+    --anno_path "$OVO_ANNO" --chunked_dir "$OVO_VIDEOS" \
     --result_dir "$OUT/ovo" \
-    --use_logits \
+    ${OVO_OPTIONS[@]+"${OVO_OPTIONS[@]}"} \
+    --mcq_prompt_policy "$OVO_MCQ_PROMPT_POLICY" \
+    --history_mode "$OVO_HISTORY_MODE" --splits "$OVO_SPLITS" \
+    --count_question_max_chunks 20 --use_logits \
     2>&1 | tee "$OUT/ovo.log"
 fi
 
-if [[ "$BENCH" == "sb" || "$BENCH" == "both" ]]; then
-  echo "=== StreamingBench  routing=$ROUTING ==="
+if [[ "$BENCH" == sb || "$BENCH" == both ]]; then
   accelerate launch --num_processes "$NPROC" \
-    experiments/evaluate_streamingbench.py \
-    "${COMMON[@]}" \
-    --anno_path "$SB_ANNO" \
-    --video_dir "$SB_VIDEOS" \
-    --result_dir "$OUT/sb" \
+    experiments/evaluate_streamingbench.py "${COMMON[@]}" \
+    --anno_path "$SB_ANNO" --video_dir "$SB_VIDEOS" \
+    --result_dir "$OUT/sb" --gate_strict_sim "$SB_GATE_STRICT_SIM" \
+    --dynamic_top_k_max "$SB_DYNAMIC_TOP_K_MAX" \
     2>&1 | tee "$OUT/sb.log"
 fi
 
-echo
-echo "Scores:  $OUT/*/scores_report.json"
-echo "Per-question gate decisions (keyword routing) are logged in each results"
-echo "row under gate_bucket / gate_memory_cues / gate_recent_cues."
+echo "Results: $OUT"
