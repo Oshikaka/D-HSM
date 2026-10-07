@@ -68,6 +68,7 @@ from dhsm.retrieval_gate import (
     strip_prompt_scaffolding,
 )
 from dhsm import shard_io
+from dhsm.benchmark_defaults import streamingbench_defaults
 from dhsm.evaluation_protocol import ensure_result_protocol
 from dhsm.video_qa import decode_video_to_chunks_qwen
 from dhsm.video_qa_qwen3 import RecentWindowQAModel
@@ -1152,6 +1153,7 @@ def run_rank(
     routing: str = ROUTING_KEYWORD,
     gate_strict_sim: float = DEFAULT_GATE_STRICT_SIM,
     media_manifest: dict[str, Any] | None = None,
+    memory_floor: float | None = None,
 ) -> list[dict[str, Any]]:
     if routing != ROUTING_KEYWORD:
         raise ValueError("Only question-based keyword routing is supported")
@@ -1237,13 +1239,11 @@ def run_rank(
                     route = f"baseline_{baseline_sampling}"
                 else:
                     route, gate_decision = route_question_by_keyword(question)
-                # History is injected under the stricter floor only when the
-                # question's wording did not settle whether history is needed.
-                min_evidence_sim = (
-                    gate_strict_sim
-                    if gate_decision is not None and gate_decision.strict_evidence
-                    else None
-                )
+                # Evidence floors post-filter graph seeds; recent/count paths
+                # keep their original behavior.
+                min_evidence_sim = None
+                if route == ROUTE_GRAPH and gate_decision is not None:
+                    min_evidence_sim = gate_strict_sim if gate_decision.strict_evidence else memory_floor
                 ts_sec = float(timestamp_to_seconds(question.get("time_stamp", 0.0)))
                 row_media = source_media | {"input_used_for_question": False}
 
@@ -1497,14 +1497,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--gate_strict_sim",
-        type=float,
-        default=DEFAULT_GATE_STRICT_SIM,
-        help=(
-            "Similarity floor applied when the keyword gate cannot tell whether "
-            "history is needed (the 'ambiguous' bucket). History is injected only "
-            "if some memory entry clears it."
-        ),
+        "--memory_floor", type=float, default=None,
+        help="Post-filter floor for strong-memory graph seeds; defaults by model and recent-frame budget. "
+             "Unknown profiles keep the original base cutoff without an extra floor.",
+    )
+    parser.add_argument(
+        "--gate_strict_sim", type=float, default=None,
+        help="Post-filter floor for ambiguous graph seeds; defaults by model and recent-frame budget.",
+    )
+    parser.add_argument(
+        "--spoke_attach_threshold", type=float, default=None,
+        help="Spoke-to-hub similarity threshold for entity_resolved memory; defaults by model and "
+             "recent-frame budget. Entity-to-entity merging remains at 0.65.",
     )
     parser.add_argument(
         "--top_k",
@@ -1519,8 +1523,8 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--dynamic_top_k_max", type=int, default=12,
-        help="Maximum candidate pool for dynamic retrieval (default: 12). "
+        "--dynamic_top_k_max", type=int, default=None,
+        help="Maximum dynamic candidate pool; defaults by model and recent-frame budget. "
              "The original elbow rule can select fewer seeds; integer --top_k is unchanged.",
     )
     parser.add_argument(
@@ -1597,10 +1601,23 @@ def main() -> None:
     parser.add_argument("--max_videos", type=int, default=None)
     parser.add_argument("--max_questions_per_video", type=int, default=None)
     args = parser.parse_args()
+    args.memory_mode = resolve_memory_mode(args.routing, args.memory_mode)
+    defaults = streamingbench_defaults(
+        args.model_path, args.recent_frames_only, memory_mode=args.memory_mode,
+    )
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
     if args.dynamic_top_k_max < 1:
         parser.error("--dynamic_top_k_max must be positive.")
-    # Use the repaired shared memory unless an ablation is requested.
-    args.memory_mode = resolve_memory_mode(args.routing, args.memory_mode)
+    for name in ("memory_floor", "gate_strict_sim", "spoke_attach_threshold"):
+        value = getattr(args, name)
+        if name == "memory_floor" and value is None:
+            continue
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            parser.error(f"--{name} must be finite and between 0 and 1.")
+    if args.memory_mode != "entity_resolved" and args.spoke_attach_threshold != ENTITY_LINK_THRESHOLD:
+        parser.error("--spoke_attach_threshold overrides require --memory_mode entity_resolved.")
 
     accelerator = Accelerator(
         kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=24))]
@@ -1684,7 +1701,8 @@ def main() -> None:
         f"top_k={format_top_k(args.top_k, args.dynamic_top_k_max)}  "
         f"routing={args.routing}  "
         f"memory_mode={args.memory_mode}  "
-        f"gate_strict_sim={args.gate_strict_sim}  "
+        f"memory_floor={args.memory_floor}  gate_strict_sim={args.gate_strict_sim}  "
+        f"spoke_attach_threshold={args.spoke_attach_threshold}  "
         f"caption_batch_size={args.caption_batch_size}  "
         f"count_interval={args.count_interval_frames}f/"
         f"max_delta={args.count_interval_max_delta}"
@@ -1714,6 +1732,7 @@ def main() -> None:
         expand_next_action=not args.no_next_action,
         merge_spokes=not args.no_spoke_merging,
     )
+    evaluator.spoke_attach_threshold = args.spoke_attach_threshold
 
     with accelerator.split_between_processes(all_video_paths) as local_paths:
         local_video_paths = list(local_paths)
@@ -1757,6 +1776,7 @@ def main() -> None:
         routing=args.routing,
         gate_strict_sim=args.gate_strict_sim,
         media_manifest=result_protocol["media_manifest"],
+        memory_floor=args.memory_floor,
     )
 
     shard_io.write_done_marker(done_marker_path)

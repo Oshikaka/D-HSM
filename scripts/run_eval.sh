@@ -14,8 +14,6 @@ RECENT_FRAMES="${RECENT_FRAMES:-4}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 OVO_MCQ_PROMPT_POLICY="${OVO_MCQ_PROMPT_POLICY:-uniform_abstention}"
 OVO_HISTORY_MODE="${OVO_HISTORY_MODE:-dhsm}"
-SB_GATE_STRICT_SIM="${SB_GATE_STRICT_SIM:-0.55}"
-SB_DYNAMIC_TOP_K_MAX="${SB_DYNAMIC_TOP_K_MAX:-12}"
 OUT="${OUT:-results/keyword_${OVO_MCQ_PROMPT_POLICY}_${OVO_HISTORY_MODE}_${RECENT_FRAMES}f}"
 
 case "$BENCH" in
@@ -66,6 +64,19 @@ fi
 if [[ -n "${OVO_DYNAMIC_TOP_K_MAX:-}" ]]; then
   OVO_OPTIONS+=(--dynamic_top_k_max "$OVO_DYNAMIC_TOP_K_MAX")
 fi
+SB_OPTIONS=()
+if [[ -n "${SB_MEMORY_FLOOR:-}" ]]; then
+  SB_OPTIONS+=(--memory_floor "$SB_MEMORY_FLOOR")
+fi
+if [[ -n "${SB_GATE_STRICT_SIM:-}" ]]; then
+  SB_OPTIONS+=(--gate_strict_sim "$SB_GATE_STRICT_SIM")
+fi
+if [[ -n "${SB_DYNAMIC_TOP_K_MAX:-}" ]]; then
+  SB_OPTIONS+=(--dynamic_top_k_max "$SB_DYNAMIC_TOP_K_MAX")
+fi
+if [[ -n "${SB_SPOKE_ATTACH_THRESHOLD:-}" ]]; then
+  SB_OPTIONS+=(--spoke_attach_threshold "$SB_SPOKE_ATTACH_THRESHOLD")
+fi
 mkdir -p "$OUT"
 
 if [[ "$BENCH" == ovo || "$BENCH" == both ]]; then
@@ -84,8 +95,8 @@ if [[ "$BENCH" == sb || "$BENCH" == both ]]; then
   accelerate launch --num_processes "$NPROC" \
     experiments/evaluate_streamingbench.py "${COMMON[@]}" \
     --anno_path "$SB_ANNO" --video_dir "$SB_VIDEOS" \
-    --result_dir "$OUT/sb" --gate_strict_sim "$SB_GATE_STRICT_SIM" \
-    --dynamic_top_k_max "$SB_DYNAMIC_TOP_K_MAX" \
+    --result_dir "$OUT/sb" \
+    ${SB_OPTIONS[@]+"${SB_OPTIONS[@]}"} \
     2>&1 | tee "$OUT/sb.log"
 fi
 

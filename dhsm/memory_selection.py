@@ -1,7 +1,7 @@
 """Shared memory selection for the OVO-Bench and StreamingBench evaluators."""
 
 from .entity_memory import EntityResolvedMemory
-from .hub_and_spoke import _is_count_question
+from .hub_and_spoke import ENTITY_LINK_THRESHOLD, _is_count_question
 from .hub_and_spoke_incremental import IncrementalHubAndSpokeEvaluator
 from .retrieval_gate import ROUTING_KEYWORD
 
@@ -30,12 +30,14 @@ class EntityResolvedHubAndSpokeEvaluator(IncrementalHubAndSpokeEvaluator):
                     f"EntityResolvedMemory does not implement the {flag!r} "
                     "ablation switch; run it with the default."
                 )
-        return EntityResolvedMemory(
+        memory = EntityResolvedMemory(
             embed_model=self.embed_model,
             embed_device=self.embed_device,
             sim_threshold=self.sim_threshold,
             dynamic_top_k_max=self.dynamic_top_k_max,
         )
+        memory.spoke_attach_threshold = getattr(self, "spoke_attach_threshold", ENTITY_LINK_THRESHOLD)
+        return memory
 
     def build_memory_from_chunks(self, chunks, question: str | None = None):
         # Preserve chunk selection/caption order and store actual chunk IDs.

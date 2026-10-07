@@ -127,7 +127,7 @@ class IncrementalHubAndSpokeMemory:
         embs = np.stack([h.embedding for h in hubs])
         sims = embs @ emb
         best = int(np.argmax(sims))
-        if sims[best] >= ENTITY_LINK_THRESHOLD:
+        if sims[best] >= getattr(self, "spoke_attach_threshold", ENTITY_LINK_THRESHOLD):
             return hubs[best].node_id
         return None
 
